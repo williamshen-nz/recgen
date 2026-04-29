@@ -50,7 +50,6 @@ opencv-python-headless = ">=4.8"
 utils3d = { git = "https://github.com/EasternJournalist/utils3d.git", rev = "9a4eb15e4021b67b12c460c7057d642626897ec8" }
 fastapi = ">=0.110"
 uvicorn = ">=0.27"
-python-multipart = ">=0.0.9"
 msgpack = ">=1.0"
 msgpack-numpy = ">=0.4.8"
 
