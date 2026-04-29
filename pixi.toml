@@ -48,6 +48,11 @@ tqdm = ">=4.60"
 plyfile = ">=1.0"
 opencv-python-headless = ">=4.8"
 utils3d = { git = "https://github.com/EasternJournalist/utils3d.git", rev = "9a4eb15e4021b67b12c460c7057d642626897ec8" }
+fastapi = ">=0.110"
+uvicorn = ">=0.27"
+python-multipart = ">=0.0.9"
+msgpack = ">=1.0"
+msgpack-numpy = ">=0.4.8"
 
 # ── GLB export feature ──────────────────────────────────────────────────
 [feature.glb.pypi-dependencies]
@@ -111,5 +116,6 @@ cu118 = { features = ["base", "cu118", "glb", "vis"], solve-group = "cu118" }
 # ── Tasks ────────────────────────────────────────────────────────────────
 [tasks]
 post-install = { cmd = "python -m pip install psutil packaging && CUDA_HOME=$CONDA_PREFIX python -m pip install --no-build-isolation flash-attn || echo 'flash-attn skipped, will use SDPA fallback'", description = "Install flash-attn (optional)" }
+serve = { cmd = "python scripts/server.py", description = "Start the FastAPI inference server" }
 build-nvdiffrast = { cmd = "CUDA_HOME=$CONDA_PREFIX bash scripts/setup_cuda.sh --nvdiffrast", description = "Build nvdiffrast from source (needed for GLB export)" }
 build-gaussian-rasterizer = { cmd = "CUDA_HOME=$CONDA_PREFIX bash scripts/setup_cuda.sh --diff-gaussian", description = "Build diff_gaussian_rasterization from source (needed for GLB export)" }

@@ -1,0 +1,196 @@
+"""FastAPI server for RecGen single-view inference.
+
+The pipeline is loaded once at startup (via FastAPI's lifespan) so the first
+request does not pay the model-load cost. Inputs and outputs are msgpack
+blobs carrying numpy arrays directly (via msgpack-numpy) — no PNG round-trip.
+
+Run with::
+
+    pixi run serve
+    # or
+    pixi run python scripts/server.py --host 0.0.0.0 --port 7324
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Dict
+
+os.environ.setdefault("SPCONV_ALGO", "native")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+import msgpack
+import msgpack_numpy
+import numpy as np
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+
+from recgen_inference import build_recgen, generate
+from recgen_inference._result import RecGenResult
+
+msgpack_numpy.patch()  # teach msgpack to encode/decode np.ndarray natively
+
+logger = logging.getLogger("recgen_inference.server")
+
+_state: Dict[str, Any] = {"pipeline": None, "checkpoint": None, "device": None}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    checkpoint = _state["checkpoint"]
+    device = _state["device"]
+    logger.info("Loading RecGen pipeline (%s) on %s", checkpoint, device)
+    _state["pipeline"] = build_recgen.build(checkpoint, device=device)
+    logger.info("Pipeline ready.")
+    try:
+        yield
+    finally:
+        _state["pipeline"] = None
+
+
+app = FastAPI(
+    title="RecGen Inference",
+    description="HTTP wrapper around recgen_inference: single-view RGB-D 3D reconstruction.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+def _require_array(payload: Dict[str, Any], key: str, *, ndim: int | tuple[int, ...]) -> np.ndarray:
+    if key not in payload:
+        raise HTTPException(status_code=400, detail=f"missing field: {key!r}")
+    arr = payload[key]
+    if not isinstance(arr, np.ndarray):
+        raise HTTPException(
+            status_code=400,
+            detail=f"field {key!r} must be a numpy array (sent via msgpack-numpy); got {type(arr).__name__}",
+        )
+    expected = (ndim,) if isinstance(ndim, int) else tuple(ndim)
+    if arr.ndim not in expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"field {key!r} must have ndim in {expected}; got shape {arr.shape}",
+        )
+    return arr
+
+
+def _pack_result(result: RecGenResult) -> bytes:
+    """Serialize the minimal payload: pose + camera-frame mesh."""
+    mesh = result.mesh
+    payload: Dict[str, Any] = {
+        "pose_matrix": np.ascontiguousarray(result.pose_matrix, dtype=np.float64),
+        "pose_quat": np.ascontiguousarray(result.pose_quat, dtype=np.float64),
+        "vertices": np.ascontiguousarray(mesh.vertices, dtype=np.float32),
+        "faces": np.ascontiguousarray(mesh.faces, dtype=np.int32),
+    }
+    colors = getattr(mesh.visual, "vertex_colors", None)
+    if colors is not None and len(colors) == len(mesh.vertices):
+        payload["vertex_colors"] = np.ascontiguousarray(colors, dtype=np.uint8)
+    return msgpack.packb(payload, use_bin_type=True)
+
+
+def _ensure_pipeline():
+    pipeline = _state.get("pipeline")
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not loaded yet")
+    return pipeline
+
+
+@app.get("/health")
+def health() -> JSONResponse:
+    return JSONResponse({
+        "status": "ok",
+        "pipeline_loaded": _state.get("pipeline") is not None,
+        "checkpoint": _state.get("checkpoint"),
+    })
+
+
+@app.post("/generate")
+async def generate_endpoint(request: Request) -> Response:
+    """Single-view inference.
+
+    Request body: msgpack blob (Content-Type: application/x-msgpack) with keys:
+        - ``rgb``: (H, W, 3) uint8 RGB
+        - ``depth``: (H, W) uint16 mm or float32 m
+        - ``mask``: (H, W) any int dtype, non-zero = object
+        - ``intrinsics``: (3, 3) float
+        - ``seed``: int (optional, default 1)
+
+    Response: msgpack blob with keys ``pose_matrix`` (4,4 float64),
+    ``pose_quat`` (7 float64), ``vertices`` (N,3 float32),
+    ``faces`` (M,3 int32), ``vertex_colors`` (N,4 uint8, optional).
+    """
+    pipeline = _ensure_pipeline()
+    t_start = time.perf_counter()
+
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty request body; expected msgpack")
+    try:
+        payload = msgpack.unpackb(body, raw=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"could not msgpack-decode body: {e}")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="msgpack body must decode to a dict")
+
+    rgb_arr = _require_array(payload, "rgb", ndim=3)
+    depth_arr = _require_array(payload, "depth", ndim=2)
+    mask_arr = _require_array(payload, "mask", ndim=2)
+    K = _require_array(payload, "intrinsics", ndim=2)
+    if K.shape != (3, 3):
+        raise HTTPException(status_code=400, detail=f"intrinsics must be (3,3); got {K.shape}")
+    seed = int(payload.get("seed", 1))
+
+    t_inf = time.perf_counter()
+    result = generate(
+        pipeline,
+        image=rgb_arr,
+        depth=depth_arr,
+        mask=mask_arr,
+        intrinsics=K,
+        seed=seed,
+    )
+    inference_s = time.perf_counter() - t_inf
+
+    response_body = _pack_result(result)
+    total_s = time.perf_counter() - t_start
+    logger.info(
+        "/generate ok  inference=%.3fs  total=%.3fs  rgb=%s depth=%s req_bytes=%d resp_bytes=%d",
+        inference_s,
+        total_s,
+        rgb_arr.shape,
+        depth_arr.shape,
+        len(body),
+        len(response_body),
+    )
+    return Response(content=response_body, media_type="application/x-msgpack")
+
+
+def main() -> None:
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Serve RecGen as a FastAPI app")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=7324)
+    parser.add_argument(
+        "--checkpoint",
+        default="recgen_base.multiview_stereo",
+        help="RecGen checkpoint name (see build_recgen.list_checkpoints())",
+    )
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--log-level", default="info")
+    args = parser.parse_args()
+
+    _state["checkpoint"] = args.checkpoint
+    _state["device"] = args.device
+
+    logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, workers=1)
+
+
+if __name__ == "__main__":
+    main()
