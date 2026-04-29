@@ -18,6 +18,9 @@ env/
 outputs/
 .ipynb_checkpoints/
 
+# Local capture data (tiptop runs etc.)
+data/
+
 # Regression / run outputs
 regression_output/
 output/
