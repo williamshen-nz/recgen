@@ -52,6 +52,7 @@ fastapi = ">=0.110"
 uvicorn = ">=0.27"
 msgpack = ">=1.0"
 msgpack-numpy = ">=0.4.8"
+fast-simplification = ">=0.1"
 
 # ── GLB export feature ──────────────────────────────────────────────────
 [feature.glb.pypi-dependencies]

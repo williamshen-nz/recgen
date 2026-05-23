@@ -26,6 +26,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 import msgpack
 import msgpack_numpy
 import numpy as np
+import trimesh
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -76,6 +77,31 @@ def _require_array(payload: Dict[str, Any], key: str, *, ndim: int | tuple[int, 
             detail=f"field {key!r} must have ndim in {expected}; got shape {arr.shape}",
         )
     return arr
+
+
+def _decimate_mesh(mesh: trimesh.Trimesh, target_faces: int) -> trimesh.Trimesh:
+    """Quadric edge-collapse decimation of ``mesh`` to roughly ``target_faces``.
+
+    Uses ``trimesh.Trimesh.simplify_quadric_decimation``, which wraps the
+    ``fast-simplification`` package (Sven Forstmann's algorithm). Same quadric
+    edge-collapse family as the pyvista/VTK path in
+    ``recgen_modules.utils.postprocessing_utils.postprocess_mesh`` but typically
+    10–100× faster at high reduction ratios. Vertex colors collapse to the mean
+    of the original mesh's vertex colors applied uniformly — cheap and matches
+    the uniform-color convention used by downstream consumers that don't need
+    per-vertex texture.
+    """
+    n_faces = len(mesh.faces)
+    if target_faces >= n_faces:
+        return mesh
+
+    decimated = mesh.simplify_quadric_decimation(face_count=int(target_faces))
+
+    orig_colors = getattr(mesh.visual, "vertex_colors", None)
+    if orig_colors is not None and len(orig_colors) == len(mesh.vertices):
+        mean_color = np.asarray(orig_colors, dtype=np.float64).mean(axis=0).round().astype(np.uint8)
+        decimated.visual.vertex_colors = np.tile(mean_color, (len(decimated.vertices), 1))
+    return decimated
 
 
 def _pack_result(result: RecGenResult) -> bytes:
@@ -144,6 +170,8 @@ async def generate_endpoint(request: Request) -> Response:
     if K.shape != (3, 3):
         raise HTTPException(status_code=400, detail=f"intrinsics must be (3,3); got {K.shape}")
     seed = int(payload.get("seed", 1))
+    target_faces_raw = payload.get("target_faces")
+    target_faces = int(target_faces_raw) if target_faces_raw is not None else None
 
     t_inf = time.perf_counter()
     result = generate(
@@ -156,14 +184,22 @@ async def generate_endpoint(request: Request) -> Response:
     )
     inference_s = time.perf_counter() - t_inf
 
+    decimation_s = 0.0
+    if target_faces is not None and target_faces > 0:
+        t_dec = time.perf_counter()
+        result.mesh = _decimate_mesh(result.mesh, target_faces)
+        decimation_s = time.perf_counter() - t_dec
+
     response_body = _pack_result(result)
     total_s = time.perf_counter() - t_start
     logger.info(
-        "/generate ok  inference=%.3fs  total=%.3fs  rgb=%s depth=%s req_bytes=%d resp_bytes=%d",
+        "/generate ok  inference=%.3fs  decimation=%.3fs  total=%.3fs  rgb=%s depth=%s target_faces=%s req_bytes=%d resp_bytes=%d",
         inference_s,
+        decimation_s,
         total_s,
         rgb_arr.shape,
         depth_arr.shape,
+        target_faces,
         len(body),
         len(response_body),
     )
