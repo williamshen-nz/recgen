@@ -132,6 +132,36 @@ The result is expressed in the anchor view's camera frame.
 
 The `gaussian.ply` produced with `--save-splat` is compatible with [SuperSplat](https://superspl.at/editor), a browser-based viewer and editor. Drag the file into the editor window — no upload or install required, everything runs locally in the browser. SuperSplat is also useful for cropping, cleaning, and re-exporting splats (`.ply`, `.splat`, or compressed `.ply`).
 
+## Serving (HTTP)
+
+Run RecGen as an HTTP service. Requests and responses are msgpack blobs carrying
+numpy arrays directly (no PNG round-trip); see `scripts/client_tiptop.py` for a
+client example.
+
+```bash
+pixi run serve                              # gateway: one worker per GPU, public :18324
+pixi run serve --gpus 0,1,2,3 --port 18324  # pin the GPU set explicitly
+```
+
+`pixi run serve` starts a **gateway** that spawns one GPU-pinned worker process
+per GPU (auto-detected from `CUDA_VISIBLE_DEVICES`, else `nvidia-smi`) and
+exposes a single `/generate` endpoint. Each request is dispatched to an idle
+GPU; when all GPUs are busy, requests queue FIFO and fall back to `503` after
+`--queue-timeout` (default 300 s). The client only ever talks to the gateway —
+the multi-GPU fan-out is transparent.
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /generate` | one object: msgpack `{rgb, depth, mask, intrinsics, seed?, target_faces?}` → `{vertices, faces, vertex_colors?, pose_matrix, pose_quat}` |
+| `GET /health` | gateway status + `workers_total` / `workers_alive` / `workers_idle` |
+
+For single-GPU debugging, `pixi run serve-worker` runs one worker directly
+(no gateway) on `:18324`.
+
+> A worker that crashes mid-request is dropped from the pool (the request retries
+> on another GPU). v1 does not auto-respawn workers — restart the gateway to
+> recover full capacity.
+
 ## Troubleshooting
 
 - **`spconv` import error** — wrong CUDA variant. Reinstall with `pip install spconv-cu118` or `spconv-cu120` to match your CUDA.

@@ -2,7 +2,7 @@
 
 Spin up the server in one shell, then point this client at it::
 
-    pixi run serve                                   # shell A: starts server on :7324
+    pixi run serve                                   # shell A: starts server on :18324
     pixi run python scripts/client_tiptop.py \\      # shell B: client
         --root data/tiptop/2026-04-29_10-29-39
 
@@ -123,7 +123,7 @@ def payload_to_trimesh(payload: dict) -> trimesh.Trimesh:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RecGen HTTP client demo on tiptop data")
     p.add_argument("--root", required=True, help="Tiptop capture directory")
-    p.add_argument("--url", default="http://localhost:7324", help="RecGen server base URL")
+    p.add_argument("--url", default="http://localhost:18324", help="RecGen server base URL")
     p.add_argument("--out", default=None, help="Output dir (default: <root>/recgen_client_outputs)")
     p.add_argument("--labels", nargs="*", default=None, help="Optional label allowlist")
     p.add_argument("--min-mask-pixels", type=int, default=200)
