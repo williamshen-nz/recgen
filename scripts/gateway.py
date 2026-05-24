@@ -247,7 +247,17 @@ app = FastAPI(
 
 
 def _alive_workers() -> List[Worker]:
-    return [w for w in _state.workers if w.alive]  # type: ignore[union-attr]
+    assert _state is not None
+    alive: List[Worker] = []
+    for w in _state.workers:
+        # A worker can die while idle (crash with no request in flight); reflect
+        # that here so /health doesn't keep reporting it alive. It'll be recycled
+        # when next popped (the proxied POST fails and triggers the retry path).
+        if w.alive and w.proc.poll() is not None:
+            w.alive = False
+        if w.alive:
+            alive.append(w)
+    return alive
 
 
 @app.get("/health")
@@ -282,6 +292,10 @@ async def generate_endpoint(request: Request) -> Response:
     assert _state is not None and _state.client is not None
     cfg = _state.cfg
     body = await request.body()
+    if not body:
+        # Reject before acquiring a worker: no point cycling a GPU through the
+        # idle queue just to have the worker 400 an empty body.
+        raise HTTPException(status_code=400, detail="empty request body")
     content_type = request.headers.get("content-type", "application/x-msgpack")
 
     req_id = next(_req_counter)

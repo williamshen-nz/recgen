@@ -198,10 +198,17 @@ async def _process_object(
         print(f"[client] [{i:02d}] {label}: FAILED ({type(e).__name__}: {e})")
         return {"index": i, "label": label, "status": "failed", "error": str(e)}
 
-    mesh = payload_to_trimesh(payload)
-    obj_dir.mkdir(parents=True, exist_ok=True)
-    mesh.export(obj_dir / "mesh.obj")
-    np.save(obj_dir / "pose_matrix.npy", payload["pose_matrix"])
+    # Decode/export/save outside the request try so a malformed payload or a
+    # filesystem error fails just this object — without it, the exception would
+    # propagate out of gather() and cancel every other in-flight request.
+    try:
+        mesh = payload_to_trimesh(payload)
+        obj_dir.mkdir(parents=True, exist_ok=True)
+        mesh.export(obj_dir / "mesh.obj")
+        np.save(obj_dir / "pose_matrix.npy", payload["pose_matrix"])
+    except Exception as e:
+        print(f"[client] [{i:02d}] {label}: FAILED post-processing ({type(e).__name__}: {e})")
+        return {"index": i, "label": label, "status": "failed", "error": str(e)}
 
     print(f"[client] [{i:02d}] {label}: {elapsed:.2f}s  "
           f"({mesh.vertices.shape[0]} verts, {mesh.faces.shape[0]} faces)")
