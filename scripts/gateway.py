@@ -250,7 +250,17 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("No workers became ready; aborting gateway startup.")
     if len(ready) < len(_state.workers):
         logger.warning("%d/%d workers ready; serving with reduced capacity.", len(ready), len(_state.workers))
-    logger.info("Gateway ready: %d worker(s) serving on %s", len(ready), [w.label for w in ready])
+
+    # A multi-line banner so "we're up" is easy to spot in the worker log spam.
+    url = f"http://{cfg.host}:{cfg.port}"
+    bar = "=" * 64
+    logger.info(
+        "\n%s\n  RecGen gateway READY — serving on %s\n"
+        "  %d/%d GPU worker(s) up: %s\n"
+        "  POST %s/generate   GET %s/health\n%s",
+        bar, url, len(ready), len(_state.workers), [w.label for w in ready],
+        url, url, bar,
+    )
 
     try:
         yield
