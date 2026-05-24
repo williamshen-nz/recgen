@@ -2,7 +2,7 @@
 
 Spin up the server in one shell, then point this client at it::
 
-    pixi run serve                                   # shell A: starts server on :18324
+    pixi run serve                                   # shell A: gateway on :18324
     pixi run python scripts/client_tiptop.py \\      # shell B: client
         --root data/tiptop/2026-04-29_10-29-39
 
@@ -10,10 +10,13 @@ The client itself does NOT import torch / recgen_inference — it only needs
 opencv (for capture loading), numpy, requests, msgpack, and trimesh — so
 you can run it on a laptop while the server holds the GPU.
 
-Wire format is msgpack (numpy arrays via msgpack-numpy) in both directions —
-no PNG round-trip. For each object in the capture we POST one /generate
-request and save the returned mesh + pose. Optional: merge per-object
-meshes into a scene OBJ.
+The objects in a capture are POSTed **concurrently** (``--concurrency``, default
+4): the gateway hands each request to an idle GPU and queues the rest, so a
+multi-object capture fans out across all GPUs instead of running serially. Point
+``--url`` at the gateway (default ``:18324``); a single-GPU ``serve-worker``
+works too, it just serializes. Wire format is msgpack (numpy arrays via
+msgpack-numpy) in both directions — no PNG round-trip. For each object we save
+the returned mesh + pose; optionally merge per-object meshes into a scene OBJ.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Sequence
 
@@ -87,18 +91,19 @@ def post_generate(
     K: np.ndarray,
     seed: int,
     timeout: float,
+    target_faces: int | None = None,
 ) -> dict:
     """POST one object to /generate. Returns the unpacked msgpack payload."""
-    body = msgpack.packb(
-        {
-            "rgb": np.ascontiguousarray(rgb),
-            "depth": np.ascontiguousarray(depth),
-            "mask": np.ascontiguousarray((mask > 0).astype(np.uint8)),
-            "intrinsics": np.ascontiguousarray(K, dtype=np.float64),
-            "seed": int(seed),
-        },
-        use_bin_type=True,
-    )
+    payload = {
+        "rgb": np.ascontiguousarray(rgb),
+        "depth": np.ascontiguousarray(depth),
+        "mask": np.ascontiguousarray((mask > 0).astype(np.uint8)),
+        "intrinsics": np.ascontiguousarray(K, dtype=np.float64),
+        "seed": int(seed),
+    }
+    if target_faces is not None:
+        payload["target_faces"] = int(target_faces)
+    body = msgpack.packb(payload, use_bin_type=True)
     r = requests.post(
         f"{url.rstrip('/')}/generate",
         data=body,
@@ -129,6 +134,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-mask-pixels", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--timeout", type=float, default=600.0, help="Per-request timeout (s)")
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="Max in-flight requests; set near the server's GPU count.",
+    )
+    p.add_argument(
+        "--target-faces",
+        type=int,
+        default=None,
+        help="If set, server-side decimate each mesh to roughly this many faces.",
+    )
     p.add_argument("--no-merge", action="store_true", help="Skip merged scene mesh export")
     return p.parse_args()
 
@@ -145,6 +162,49 @@ def _check_health(url: str) -> None:
         print("[client] WARNING: pipeline not loaded yet — first request will block.")
 
 
+def _process_object(args, rgb, depth, K, out_root, i: int, label: str, mask: np.ndarray) -> dict:
+    """POST one object, save its mesh + pose, return a summary entry.
+
+    Runs in a worker thread; the blocking POST releases the GIL, so many of
+    these proceed in parallel and the gateway spreads them across GPUs. The
+    decoded mesh is stashed under ``_mesh`` for the optional merge step (popped
+    off before the entry is written to summary.json).
+    """
+    obj_dir = out_root / f"{i:02d}_{label}"
+    try:
+        t0 = time.perf_counter()
+        payload = post_generate(
+            args.url, rgb, depth, mask, K, args.seed, args.timeout, args.target_faces
+        )
+        elapsed = time.perf_counter() - t0
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        body = e.response.text[:500] if e.response is not None else ""
+        print(f"[client] [{i:02d}] {label}: HTTP {code} — {body}")
+        return {"index": i, "label": label, "status": "failed", "error": str(e)}
+    except Exception as e:
+        print(f"[client] [{i:02d}] {label}: FAILED ({type(e).__name__}: {e})")
+        return {"index": i, "label": label, "status": "failed", "error": str(e)}
+
+    mesh = payload_to_trimesh(payload)
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    mesh.export(obj_dir / "mesh.obj")
+    np.save(obj_dir / "pose_matrix.npy", payload["pose_matrix"])
+
+    print(f"[client] [{i:02d}] {label}: {elapsed:.2f}s  "
+          f"({mesh.vertices.shape[0]} verts, {mesh.faces.shape[0]} faces)")
+    return {
+        "index": i,
+        "label": label,
+        "status": "ok",
+        "round_trip_s": elapsed,
+        "n_vertices": int(mesh.vertices.shape[0]),
+        "n_faces": int(mesh.faces.shape[0]),
+        "pose_matrix": payload["pose_matrix"].tolist(),
+        "_mesh": mesh,
+    }
+
+
 def main() -> None:
     args = parse_args()
     root = Path(args.root).resolve()
@@ -157,49 +217,32 @@ def main() -> None:
 
     selection = select_indices(bboxes, args.labels)
 
-    summary: list[dict] = []
-    posed_meshes: list[trimesh.Trimesh] = []
+    # Filter to objects with enough mask pixels; the rest are skipped up front.
+    todo: list[tuple[int, str, np.ndarray]] = []
     for i in selection:
         label = bboxes[i]["label"]
         mask = masks[i].astype(np.uint8)
         n_px = int(mask.sum())
-        obj_dir = out_root / f"{i:02d}_{label}"
-
         if n_px < args.min_mask_pixels:
             print(f"[client] [{i:02d}] {label}: SKIP ({n_px} mask pixels)")
             continue
+        todo.append((i, label, mask))
 
-        print(f"[client] [{i:02d}] {label}: POSTing ({n_px} mask pixels)")
-        try:
-            t0 = time.perf_counter()
-            payload = post_generate(args.url, rgb, depth, mask, K, args.seed, args.timeout)
-            elapsed = time.perf_counter() - t0
-        except requests.HTTPError as e:
-            body = e.response.text[:500] if e.response is not None else ""
-            print(f"[client] [{i:02d}] {label}: HTTP {e.response.status_code if e.response else '?'} — {body}")
-            summary.append({"index": i, "label": label, "status": "failed", "error": str(e)})
-            continue
-        except Exception as e:
-            print(f"[client] [{i:02d}] {label}: FAILED ({type(e).__name__}: {e})")
-            summary.append({"index": i, "label": label, "status": "failed", "error": str(e)})
-            continue
+    print(f"[client] Dispatching {len(todo)} object(s) with concurrency={args.concurrency}")
+    t_all = time.perf_counter()
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+        futures = {
+            pool.submit(_process_object, args, rgb, depth, K, out_root, i, label, mask): i
+            for (i, label, mask) in todo
+        }
+        for fut in as_completed(futures):
+            results.append(fut.result())
 
-        mesh = payload_to_trimesh(payload)
-        obj_dir.mkdir(parents=True, exist_ok=True)
-        mesh.export(obj_dir / "mesh.obj")
-        np.save(obj_dir / "pose_matrix.npy", payload["pose_matrix"])
-
-        print(f"[client] [{i:02d}] {label}: {elapsed:.2f}s  ({mesh.vertices.shape[0]} verts, {mesh.faces.shape[0]} faces)")
-        summary.append({
-            "index": i,
-            "label": label,
-            "status": "ok",
-            "round_trip_s": elapsed,
-            "n_vertices": int(mesh.vertices.shape[0]),
-            "n_faces": int(mesh.faces.shape[0]),
-            "pose_matrix": payload["pose_matrix"].tolist(),
-        })
-        posed_meshes.append(mesh)
+    results.sort(key=lambda s: s["index"])
+    posed_meshes = [s.pop("_mesh") for s in results if s["status"] == "ok"]
+    summary = results
+    print(f"[client] All requests done in {time.perf_counter() - t_all:.2f}s wall")
 
     with open(out_root / "summary.json", "w") as f:
         json.dump({"server_url": args.url, "objects": summary}, f, indent=2)

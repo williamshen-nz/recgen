@@ -53,12 +53,72 @@ client (aiohttp, unchanged)
   Recoverable errors (bad input, etc.) come back as an HTTP 500 and the worker
   stays up.
 
+## Design decisions (the why)
+
+Captured here so the next person doesn't re-litigate them.
+
+- **One process per GPU, not one process spanning GPUs.** A PyTorch model lives
+  in a single process's CUDA context, and the GIL prevents real parallelism
+  across GPUs in one process. Separate processes are the only clean way to drive
+  4 GPUs at once, and they also isolate failures (one crash ≠ all down).
+
+- **Server-side gateway, not client-side balancing across 4 ports.** We
+  considered just opening 4 ports and letting the client pick. Rejected because:
+  multiple clients can't coordinate (two clients would both hammer GPU 0 while
+  others idle); the client would have to reimplement health/retry/failover; and
+  there'd be no global queue. A central gateway gives one stable URL, global
+  fairness, and one place for health/metrics.
+
+- **Idle-worker queue, not round-robin / nginx.** Each generation is *seconds*
+  of GPU work, so head-of-line blocking is the enemy: a dumb round-robin (or
+  nginx without live busy-tracking) can queue a request behind a busy worker
+  while another GPU sits idle. An `asyncio.Queue` of idle workers means every
+  request pops a genuinely-free GPU; when all are busy, requests wait FIFO and
+  fall back to 503. ~50 lines, no extra infra.
+
+- **Synchronous (hold the connection), not async job+poll.** The client is
+  already async (`aiohttp`, `gather` per object) with a long timeout, so holding
+  the connection gives cross-GPU parallelism with *zero* client changes. Job IDs
+  + a `/status` endpoint + result storage would be real added complexity that
+  buys nothing here (the client never needs to survive a disconnect mid-job).
+
+- **Internal HTTP workers, not a `ProcessPoolExecutor` / `multiprocessing`.**
+  Reusing `server.py` as the worker keeps each GPU in its own clean CUDA process
+  (no fork/spawn-CUDA hazards), avoids pickling multi-MB numpy arrays through a
+  pool, and lets you curl a single worker directly when debugging. Cost is 4
+  localhost ports + a thin gateway — worth it.
+
+- **No Redis/Celery/queue broker.** Single-host, in-process queue is enough and
+  keeps ops trivial (one command, no broker to run). Revisit only if scaling
+  across machines.
+
+- **Self-healing at the source for poisoned CUDA contexts.** The nastier GPU
+  failure isn't a crash — it's a corrupted-but-alive context (device-side assert
+  / illegal access) that returns 500s forever. Detecting that from the gateway by
+  parsing error bodies is brittle, so the *worker* probes its own context after a
+  failure and self-exits if wedged, funneling it into the same crash→respawn
+  path. One mechanism covers both crash and poison.
+
+- **Pre-warm weights once in the gateway, before spawning workers.** Otherwise
+  all 4 workers boot together and each calls `hf_hub_download` for the same
+  files — a redundant download storm on first launch. The gateway runs
+  `snapshot_download(repo)` first so every worker then loads from cache. (HF file
+  locks already prevent *corruption*; this just removes the wasteful contention.)
+  Disable with `--hf-repo ''` if you manage the cache yourself.
+
+- **Client fans out with a thread pool, not async.** The demo client keeps its
+  `requests` dependency (no torch, runs on a laptop) and just submits objects to
+  a `ThreadPoolExecutor` — blocking POSTs release the GIL, so they overlap and the
+  gateway spreads them across GPUs. `--concurrency` (default 4) should track the
+  server's GPU count.
+
 ## Files changed on this branch
 
 | File | Change |
 | --- | --- |
-| `scripts/gateway.py` | **New.** Supervisor + dispatcher (spawns workers, idle-queue routing, health, retry). |
-| `scripts/server.py` | Per-GPU worker. `generate()` moved off the event loop into a single-thread executor; added `--worker-label` for log prefixes. Role otherwise unchanged. |
+| `scripts/gateway.py` | **New.** Supervisor + dispatcher: pre-warms weights, spawns one worker per GPU, idle-queue routing, health, retry, and background recycle of dead/poisoned workers. |
+| `scripts/server.py` | Per-GPU worker. `generate()` moved off the event loop into a single-thread executor; self-exits on a wedged CUDA context so the gateway respawns it; added `--worker-label` for log prefixes. |
+| `scripts/client_tiptop.py` | Demo client now POSTs objects concurrently (`--concurrency`, default 4) to fan out across GPUs; added `--target-faces`; default URL → `:18324`. |
 | `pixi.toml` | Added `httpx`; `serve` now launches the gateway; new `serve-worker` task for single-GPU debugging. |
 | `pyproject.toml` | Added `httpx>=0.27`. |
 | `README.md` | New "Serving (HTTP)" section. |
@@ -84,9 +144,12 @@ client (aiohttp, unchanged)
    # or pin explicitly / change port:
    pixi run serve --gpus 0,1,2,3 --port 18324
    ```
-   Startup loads the model 4x (once per worker, in parallel). The gateway logs
-   per-worker readiness and only begins serving once at least one worker is up
-   (warns if fewer than all 4 came up). Watch for `Gateway ready: 4 worker(s)`.
+   On **first launch** the gateway pre-warms the weights cache once
+   (`Pre-warming weights cache for TRI-ML/RecGen ...`) before spawning workers,
+   so the 4 workers don't all download at once. It then loads the model 4x (once
+   per worker, in parallel), logs per-worker readiness, and only begins serving
+   once at least one worker is up (warns if fewer than all 4 came up). Watch for
+   `Gateway ready: 4 worker(s)`.
 
 4. **Point the client at it** — set the client's `server_url` to
    `http://<workstation-host>:18324`. Nothing else changes.
@@ -102,6 +165,7 @@ client (aiohttp, unchanged)
 | `--queue-timeout` | `300` s | Max wait for a free GPU before returning `503`. |
 | `--request-timeout` | `600` s | Max time for one worker `/generate`. Keep >= client timeout. |
 | `--worker-startup-timeout` | `600` s | Max wait per worker to load its pipeline at boot. |
+| `--hf-repo` | `TRI-ML/RecGen` | Repo pre-warmed into the HF cache before workers spawn. Set to `''` to skip. |
 
 ## Verifying it works (do this on the box)
 
