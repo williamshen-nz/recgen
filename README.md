@@ -148,7 +148,13 @@ per GPU (auto-detected from `CUDA_VISIBLE_DEVICES`, else `nvidia-smi`) and
 exposes a single `/generate` endpoint. Each request is dispatched to an idle
 GPU; when all GPUs are busy, requests queue FIFO and fall back to `503` after
 `--queue-timeout` (default 300 s). The client only ever talks to the gateway —
-the multi-GPU fan-out is transparent.
+the multi-GPU fan-out is transparent. To fan out, the client must send requests
+**concurrently** (the async `scripts/client_tiptop.py` does this); a single
+client looping one request at a time will only ever use one GPU.
+
+Startup is staggered: one worker loads first to warm the shared weight caches
+(HF + the `torch.hub`/DINOv2 download), then the rest load from cache — so a cold
+machine does a single download pass instead of N workers racing.
 
 | Endpoint | Description |
 | --- | --- |

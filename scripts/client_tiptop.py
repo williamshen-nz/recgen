@@ -7,32 +7,34 @@ Spin up the server in one shell, then point this client at it::
         --root data/tiptop/2026-04-29_10-29-39
 
 The client itself does NOT import torch / recgen_inference — it only needs
-opencv (for capture loading), numpy, requests, msgpack, and trimesh — so
+opencv (for capture loading), numpy, aiohttp, msgpack, and trimesh — so
 you can run it on a laptop while the server holds the GPU.
 
-The objects in a capture are POSTed **concurrently** (``--concurrency``, default
-4): the gateway hands each request to an idle GPU and queues the rest, so a
-multi-object capture fans out across all GPUs instead of running serially. Point
-``--url`` at the gateway (default ``:18324``); a single-GPU ``serve-worker``
-works too, it just serializes. Wire format is msgpack (numpy arrays via
-msgpack-numpy) in both directions — no PNG round-trip. For each object we save
-the returned mesh + pose; optionally merge per-object meshes into a scene OBJ.
+It is fully ``async`` (one shared ``aiohttp.ClientSession``), mirroring the
+real downstream client: the objects in a capture are POSTed **concurrently**,
+bounded by ``--concurrency`` (default 4) via a semaphore. The gateway hands each
+request to an idle GPU and queues the rest, so a multi-object capture fans out
+across all GPUs instead of running serially. Point ``--url`` at the gateway
+(default ``:18324``); a single-GPU ``serve-worker`` works too, it just
+serializes. Wire format is msgpack (numpy arrays via msgpack-numpy) in both
+directions — no PNG round-trip. For each object we save the returned mesh + pose;
+optionally merge per-object meshes into a scene OBJ.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Sequence
 
+import aiohttp
 import cv2
 import msgpack
 import msgpack_numpy
 import numpy as np
-import requests
 import trimesh
 
 msgpack_numpy.patch()
@@ -83,7 +85,8 @@ def select_indices(bboxes: Sequence[dict], labels: Sequence[str] | None) -> list
 # HTTP
 # ---------------------------------------------------------------------------
 
-def post_generate(
+async def post_generate(
+    session: aiohttp.ClientSession,
     url: str,
     rgb: np.ndarray,
     depth: np.ndarray,
@@ -93,7 +96,11 @@ def post_generate(
     timeout: float,
     target_faces: int | None = None,
 ) -> dict:
-    """POST one object to /generate. Returns the unpacked msgpack payload."""
+    """POST one object to /generate. Returns the unpacked msgpack payload.
+
+    Mirrors the real async client: one shared ``aiohttp.ClientSession`` is used
+    for all requests so many can be in flight at once over the event loop.
+    """
     payload = {
         "rgb": np.ascontiguousarray(rgb),
         "depth": np.ascontiguousarray(depth),
@@ -104,14 +111,14 @@ def post_generate(
     if target_faces is not None:
         payload["target_faces"] = int(target_faces)
     body = msgpack.packb(payload, use_bin_type=True)
-    r = requests.post(
+    async with session.post(
         f"{url.rstrip('/')}/generate",
         data=body,
         headers={"Content-Type": "application/x-msgpack"},
-        timeout=timeout,
-    )
-    r.raise_for_status()
-    return msgpack.unpackb(r.content, raw=False)
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        resp.raise_for_status()
+        return msgpack.unpackb(await resp.read(), raw=False)
 
 
 def payload_to_trimesh(payload: dict) -> trimesh.Trimesh:
@@ -150,37 +157,40 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _check_health(url: str) -> None:
+async def _check_health(session: aiohttp.ClientSession, url: str) -> None:
     try:
-        r = requests.get(f"{url.rstrip('/')}/health", timeout=5)
-        r.raise_for_status()
+        async with session.get(
+            f"{url.rstrip('/')}/health", timeout=aiohttp.ClientTimeout(total=5)
+        ) as r:
+            r.raise_for_status()
+            body = await r.json()
     except Exception as e:
         raise SystemExit(f"[client] server health check failed at {url}: {e}")
-    body = r.json()
     print(f"[client] server health: {body}")
     if not body.get("pipeline_loaded"):
         print("[client] WARNING: pipeline not loaded yet — first request will block.")
 
 
-def _process_object(args, rgb, depth, K, out_root, i: int, label: str, mask: np.ndarray) -> dict:
+async def _process_object(
+    session: aiohttp.ClientSession, sem: asyncio.Semaphore, args, rgb, depth, K,
+    out_root: Path, i: int, label: str, mask: np.ndarray,
+) -> dict:
     """POST one object, save its mesh + pose, return a summary entry.
 
-    Runs in a worker thread; the blocking POST releases the GIL, so many of
-    these proceed in parallel and the gateway spreads them across GPUs. The
-    decoded mesh is stashed under ``_mesh`` for the optional merge step (popped
-    off before the entry is written to summary.json).
+    ``sem`` bounds how many requests are in flight at once. The decoded mesh is
+    stashed under ``_mesh`` for the optional merge step (popped off before the
+    entry is written to summary.json).
     """
     obj_dir = out_root / f"{i:02d}_{label}"
     try:
         t0 = time.perf_counter()
-        payload = post_generate(
-            args.url, rgb, depth, mask, K, args.seed, args.timeout, args.target_faces
-        )
+        async with sem:
+            payload = await post_generate(
+                session, args.url, rgb, depth, mask, K, args.seed, args.timeout, args.target_faces
+            )
         elapsed = time.perf_counter() - t0
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        body = e.response.text[:500] if e.response is not None else ""
-        print(f"[client] [{i:02d}] {label}: HTTP {code} — {body}")
+    except aiohttp.ClientResponseError as e:
+        print(f"[client] [{i:02d}] {label}: HTTP {e.status} — {e.message}")
         return {"index": i, "label": label, "status": "failed", "error": str(e)}
     except Exception as e:
         print(f"[client] [{i:02d}] {label}: FAILED ({type(e).__name__}: {e})")
@@ -205,16 +215,12 @@ def _process_object(args, rgb, depth, K, out_root, i: int, label: str, mask: np.
     }
 
 
-def main() -> None:
-    args = parse_args()
+async def _run(args) -> None:
     root = Path(args.root).resolve()
     out_root = Path(args.out).resolve() if args.out else root / "recgen_client_outputs"
     out_root.mkdir(parents=True, exist_ok=True)
 
-    _check_health(args.url)
     rgb, depth, masks, bboxes, K = load_capture(root)
-    print(f"[client] Loaded {root}: rgb={rgb.shape}, depth={depth.shape}, {masks.shape[0]} objects")
-
     selection = select_indices(bboxes, args.labels)
 
     # Filter to objects with enough mask pixels; the rest are skipped up front.
@@ -228,16 +234,19 @@ def main() -> None:
             continue
         todo.append((i, label, mask))
 
-    print(f"[client] Dispatching {len(todo)} object(s) with concurrency={args.concurrency}")
+    sem = asyncio.Semaphore(max(1, args.concurrency))
     t_all = time.perf_counter()
-    results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        futures = {
-            pool.submit(_process_object, args, rgb, depth, K, out_root, i, label, mask): i
+    async with aiohttp.ClientSession() as session:
+        await _check_health(session, args.url)
+        print(f"[client] Loaded {root}: rgb={rgb.shape}, depth={depth.shape}, "
+              f"{masks.shape[0]} objects")
+        print(f"[client] Dispatching {len(todo)} object(s) with concurrency={args.concurrency}")
+        # Fire all objects onto the event loop at once; the semaphore caps how
+        # many are actually in flight, and the gateway fans them across GPUs.
+        results = await asyncio.gather(*(
+            _process_object(session, sem, args, rgb, depth, K, out_root, i, label, mask)
             for (i, label, mask) in todo
-        }
-        for fut in as_completed(futures):
-            results.append(fut.result())
+        ))
 
     results.sort(key=lambda s: s["index"])
     posed_meshes = [s.pop("_mesh") for s in results if s["status"] == "ok"]
@@ -258,6 +267,10 @@ def main() -> None:
         scene_path = out_root / "scene_mesh.obj"
         trimesh.util.concatenate(posed_meshes).export(scene_path)
         print(f"[client] Wrote merged scene mesh: {scene_path}")
+
+
+def main() -> None:
+    asyncio.run(_run(parse_args()))
 
 
 if __name__ == "__main__":

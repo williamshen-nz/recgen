@@ -20,11 +20,16 @@ import functools
 import logging
 import os
 import time
+import warnings
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 os.environ.setdefault("SPCONV_ALGO", "native")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+# spconv spams a FutureWarning per kernel about torch.cuda.amp.custom_fwd/bwd
+# being deprecated. It fires on import below, so silence it before that.
+warnings.filterwarnings("ignore", message=r".*torch\.cuda\.amp\.custom_(fwd|bwd).*")
 
 import msgpack
 import msgpack_numpy
@@ -318,6 +323,10 @@ def main() -> None:
         level=args.log_level.upper(),
         format=f"%(asctime)s %(levelname)s %(name)s {prefix}%(message)s",
     )
+    # Hugging Face Hub (httpx-based in v1.x) logs a line per cache HEAD-check on
+    # every model file at load time — pure noise. Quiet the HTTP/cache loggers.
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "filelock", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, workers=1)
 
 

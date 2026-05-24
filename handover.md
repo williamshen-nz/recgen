@@ -9,7 +9,7 @@ onto the 4-GPU box.
 
 ```bash
 git checkout will/multi-gpu
-pixi install                 # pulls httpx into the lock/env
+pixi install                 # pulls httpx + aiohttp into the lock/env
 pixi run serve               # auto-detects all GPUs -> one worker each, public :18324
 ```
 
@@ -99,28 +99,37 @@ Captured here so the next person doesn't re-litigate them.
   failure and self-exits if wedged, funneling it into the same crash→respawn
   path. One mechanism covers both crash and poison.
 
-- **Pre-warm weights once in the gateway, before spawning workers.** Otherwise
-  all 4 workers boot together and each calls `hf_hub_download` for the same
-  files — a redundant download storm on first launch. The gateway runs
-  `snapshot_download(repo)` first so every worker then loads from cache. (HF file
-  locks already prevent *corruption*; this just removes the wasteful contention.)
-  Disable with `--hf-repo ''` if you manage the cache yourself.
+- **Staggered startup to warm caches once, not a hardcoded pre-warm.** If all 4
+  workers boot together on a cold machine they each fetch the same files — and
+  it's not just HF weights: the pipeline also pulls DINOv2 via `torch.hub`, whose
+  cache isn't as robust to concurrent writers. Rather than enumerate every
+  download source (and bake in a repo name), the gateway brings up **one** worker
+  first and waits for it to fully load; that single worker populates *every*
+  shared cache, then the rest start and load from cache. Robust to whatever the
+  pipeline downloads, and there's no `--hf-repo`-style knob to get wrong. Cost: one
+  extra sequential model load at startup (even on warm cache) — judged worth it.
 
-- **Client fans out with a thread pool, not async.** The demo client keeps its
-  `requests` dependency (no torch, runs on a laptop) and just submits objects to
-  a `ThreadPoolExecutor` — blocking POSTs release the GIL, so they overlap and the
-  gateway spreads them across GPUs. `--concurrency` (default 4) should track the
-  server's GPU count.
+- **Client is fully async (`aiohttp`), not thread-pooled.** This mirrors the real
+  downstream client: one shared `aiohttp.ClientSession`, all objects POSTed onto
+  the event loop, bounded by an `asyncio.Semaphore(--concurrency)` (default 4).
+  The client stays torch-free so it runs on a laptop. `--concurrency` should track
+  the server's GPU count.
+
+- **Quiet third-party logs.** `huggingface_hub` 1.x (httpx-based) logs a line per
+  cache HEAD-check on every model file, and `spconv` emits a `FutureWarning` per
+  kernel — both pure noise at startup. Workers raise those loggers to WARNING and
+  filter the spconv warning; the gateway quiets httpx too (it'd otherwise log
+  every proxied request).
 
 ## Files changed on this branch
 
 | File | Change |
 | --- | --- |
-| `scripts/gateway.py` | **New.** Supervisor + dispatcher: pre-warms weights, spawns one worker per GPU, idle-queue routing, health, retry, and background recycle of dead/poisoned workers. |
-| `scripts/server.py` | Per-GPU worker. `generate()` moved off the event loop into a single-thread executor; self-exits on a wedged CUDA context so the gateway respawns it; added `--worker-label` for log prefixes. |
-| `scripts/client_tiptop.py` | Demo client now POSTs objects concurrently (`--concurrency`, default 4) to fan out across GPUs; added `--target-faces`; default URL → `:18324`. |
-| `pixi.toml` | Added `httpx`; `serve` now launches the gateway; new `serve-worker` task for single-GPU debugging. |
-| `pyproject.toml` | Added `httpx>=0.27`. |
+| `scripts/gateway.py` | **New.** Supervisor + dispatcher: staggered worker startup (warms caches), idle-queue routing, health, retry, background recycle of dead/poisoned workers; quiets httpx logs. |
+| `scripts/server.py` | Per-GPU worker. `generate()` moved off the event loop into a single-thread executor; self-exits on a wedged CUDA context so the gateway respawns it; quiets HF/httpx logs + spconv warnings; added `--worker-label`. |
+| `scripts/client_tiptop.py` | Demo client rewritten async (`aiohttp` + semaphore, `--concurrency` default 4) to fan out across GPUs; added `--target-faces`; default URL → `:18324`. |
+| `pixi.toml` | Added `httpx` + `aiohttp`; `serve` now launches the gateway; new `serve-worker` task for single-GPU debugging. |
+| `pyproject.toml` | Added `httpx>=0.27`, `aiohttp>=3.9`. |
 | `README.md` | New "Serving (HTTP)" section. |
 
 ## Deploying on the 4-GPU workstation
@@ -144,12 +153,13 @@ Captured here so the next person doesn't re-litigate them.
    # or pin explicitly / change port:
    pixi run serve --gpus 0,1,2,3 --port 18324
    ```
-   On **first launch** the gateway pre-warms the weights cache once
-   (`Pre-warming weights cache for TRI-ML/RecGen ...`) before spawning workers,
-   so the 4 workers don't all download at once. It then loads the model 4x (once
-   per worker, in parallel), logs per-worker readiness, and only begins serving
-   once at least one worker is up (warns if fewer than all 4 came up). Watch for
-   `Gateway ready: 4 worker(s)`.
+   Startup is **staggered**: the gateway brings up one worker first
+   (`Bringing up gpu0 first to warm the weight caches...`) and waits for it to
+   load — on a cold machine that single worker does all the downloading (HF
+   weights *and* the torch.hub/DINOv2 fetch). It then starts the rest
+   (`Caches warm; starting remaining N worker(s) from cache`), which load from
+   cache in parallel. It only begins serving once at least one worker is up
+   (warns if fewer than all 4 came up). Watch for `Gateway ready: 4 worker(s)`.
 
 4. **Point the client at it** — set the client's `server_url` to
    `http://<workstation-host>:18324`. Nothing else changes.
@@ -165,7 +175,6 @@ Captured here so the next person doesn't re-litigate them.
 | `--queue-timeout` | `300` s | Max wait for a free GPU before returning `503`. |
 | `--request-timeout` | `600` s | Max time for one worker `/generate`. Keep >= client timeout. |
 | `--worker-startup-timeout` | `600` s | Max wait per worker to load its pipeline at boot. |
-| `--hf-repo` | `TRI-ML/RecGen` | Repo pre-warmed into the HF cache before workers spawn. Set to `''` to skip. |
 
 ## Verifying it works (do this on the box)
 
@@ -206,9 +215,8 @@ confirm on the 4-GPU workstation:
 - **Single-host only.** Workers are local subprocesses. Cross-machine scaling
   would need a real queue (Redis/Celery) — deliberately out of scope to keep
   infra simple.
-- **Lock file.** `httpx` was added to deps; run `pixi install` on the box so the
-  lock resolves there. `httpx` already imports fine in the current env, so this
-  is expected to be a no-op-ish resolve.
+- **Lock file.** `httpx` (gateway) and `aiohttp` (client) were added to deps; run
+  `pixi install` on the box so the lock resolves there.
 
 ## How it was tested here
 
@@ -221,6 +229,13 @@ confirm on the 4-GPU workstation:
   is recycled rather than returned to the pool, and the double-recycle guard
   holds — all pass.
 - `_cuda_context_broken()` verified to return `False` on a healthy GPU here.
+- Async client tested end-to-end against a threaded mock server: 6 objects at
+  `--concurrency 4` finished in ~0.6 s wall vs ~1.8 s serial (2 waves), results
+  ordered, all meshes written.
+- spconv `FutureWarning` confirmed silenced on `import scripts.server`.
+- The gateway's *staggered* startup and worker *respawn* paths are not unit-tested
+  (they spawn real `server.py` subprocesses) — exercise them on the box via the
+  verification list above.
 - Not yet run end-to-end against real GPUs/model — that's the verification list
   above (including the self-heal step).
 

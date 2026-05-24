@@ -101,30 +101,6 @@ def _spawn_worker(cfg: argparse.Namespace, gpu: str, port: int) -> Worker:
     return Worker(label=label, gpu=gpu, port=port, proc=_start_proc(cfg, gpu, port, label))
 
 
-def _prewarm_weights(repo: str) -> None:
-    """Download the model repo into the shared HF cache once, before workers start.
-
-    Without this, all N workers boot simultaneously and each calls
-    ``hf_hub_download`` for the same files — a redundant download storm on first
-    launch (HF file locks prevent corruption, but it's wasteful contention).
-    Warming once means every worker then loads straight from cache. Best-effort:
-    if it fails (offline, private repo, etc.) we log and let workers fend for
-    themselves — HF locking still keeps that safe, just slower.
-    """
-    try:
-        from huggingface_hub import snapshot_download
-    except Exception as e:  # pragma: no cover - huggingface_hub is a dep
-        logger.warning("Could not import huggingface_hub for pre-warm (%s); skipping", e)
-        return
-    logger.info("Pre-warming weights cache for %s ...", repo)
-    t0 = time.monotonic()
-    try:
-        snapshot_download(repo)
-        logger.info("Weights cache ready (%.1fs)", time.monotonic() - t0)
-    except Exception as e:
-        logger.warning("Pre-warm failed (%s); workers will download on demand", e)
-
-
 async def _kill_proc(proc: subprocess.Popen) -> None:
     """Terminate a process without blocking the event loop."""
     if proc.poll() is not None:
@@ -210,19 +186,26 @@ async def lifespan(app: FastAPI):
     cfg = _state.cfg
     _state.client = httpx.AsyncClient()
 
-    # Warm the shared weights cache once so the workers don't all download at
-    # once on first launch. Off the event loop since it does blocking network IO.
-    if cfg.hf_repo:
-        await asyncio.get_running_loop().run_in_executor(None, _prewarm_weights, cfg.hf_repo)
+    # Staggered startup: bring up the first worker alone and wait for it to load.
+    # That one worker populates every shared cache (HF weights *and* the
+    # torch.hub / DINOv2 download) while the others aren't running yet — so on a
+    # cold machine there's a single download pass instead of N workers racing to
+    # fetch the same files. Once it's ready, the rest load straight from cache.
+    ports = [cfg.worker_base_port + i for i in range(len(cfg.gpus))]
+    first = _spawn_worker(cfg, cfg.gpus[0], ports[0])
+    _state.workers.append(first)
+    logger.info("Bringing up %s first to warm the weight caches...", first.label)
+    first_ok = await _await_ready(_state.client, first, cfg.worker_startup_timeout)
 
-    for i, gpu in enumerate(cfg.gpus):
-        _state.workers.append(_spawn_worker(cfg, gpu, cfg.worker_base_port + i))
-
-    # Wait for all workers to load their pipelines (they load in parallel).
-    results = await asyncio.gather(
-        *(_await_ready(_state.client, w, cfg.worker_startup_timeout) for w in _state.workers)
+    rest = [_spawn_worker(cfg, gpu, port) for gpu, port in zip(cfg.gpus[1:], ports[1:])]
+    _state.workers.extend(rest)
+    if rest:
+        logger.info("Caches warm; starting remaining %d worker(s) from cache", len(rest))
+    rest_ok = await asyncio.gather(
+        *(_await_ready(_state.client, w, cfg.worker_startup_timeout) for w in rest)
     )
-    ready = [w for w, ok in zip(_state.workers, results) if ok]
+
+    ready = [w for w, ok in zip(_state.workers, [first_ok, *rest_ok]) if ok]
     for w in ready:
         _state.idle.put_nowait(w)
 
@@ -384,12 +367,6 @@ def main() -> None:
         help="RecGen checkpoint name (passed to every worker).",
     )
     parser.add_argument(
-        "--hf-repo",
-        default="TRI-ML/RecGen",
-        help="HF repo to pre-warm into the cache before spawning workers "
-             "(avoids a download storm). Set to '' to skip pre-warming.",
-    )
-    parser.add_argument(
         "--queue-timeout",
         type=float,
         default=300.0,
@@ -415,6 +392,9 @@ def main() -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s [gateway] %(message)s",
     )
+    # httpx logs every proxied request at INFO — far too chatty for the gateway.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     global _state
     _state = GatewayState(cfg=args)
