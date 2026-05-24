@@ -221,20 +221,17 @@ confirm on the 4-GPU workstation:
 ## How it was tested here
 
 - Both modules compile and import under the pixi env.
-- Gateway dispatch logic unit-tested with mocked workers (httpx `MockTransport`):
-  happy-path worker release, `503` on saturation, retry-on-dead-worker, and
-  `502` when all workers are dead — all pass.
-- Recycle logic unit-tested: connection-death schedules a background respawn (and
-  the request succeeds on another GPU), a worker that exits right after responding
-  is recycled rather than returned to the pool, and the double-recycle guard
-  holds — all pass.
-- `_cuda_context_broken()` verified to return `False` on a healthy GPU here.
-- Async client tested end-to-end against a threaded mock server: 6 objects at
-  `--concurrency 4` finished in ~0.6 s wall vs ~1.8 s serial (2 waves), results
-  ordered, all meshes written.
+- `_cuda_context_broken()` checked to return `False` on a healthy GPU here.
 - spconv `FutureWarning` confirmed silenced on `import scripts.server`.
-- The gateway's *staggered* startup and worker *respawn* paths are not unit-tested
-  (they spawn real `server.py` subprocesses) — exercise them on the box via the
+- The committed suite (`tests/`) is still just `test_build_recgen.py` and
+  `test_smoke.py`; it does **not** yet cover the gateway. The dispatch and recycle
+  paths (idle-queue release, `503` on saturation, retry-on-dead-worker, `502`
+  when all are dead, background respawn, the double-recycle guard) were exercised
+  during development with throwaway httpx `MockTransport` scripts but not turned
+  into committed tests — a good follow-up, and worth adding before relying on
+  these paths in production.
+- The gateway's *staggered* startup and worker *respawn* paths spawn real
+  `server.py` subprocesses, so they're best exercised on the box via the
   verification list above.
 - Not yet run end-to-end against real GPUs/model — that's the verification list
   above (including the self-heal step).

@@ -96,6 +96,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         _state["pipeline"] = None
+        # Tear down the generate() worker thread so the process can exit cleanly
+        # (the non-daemon thread would otherwise keep it alive on shutdown).
+        _executor.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(
@@ -248,9 +251,15 @@ async def generate_endpoint(request: Request) -> Response:
     K = _require_array(payload, "intrinsics", ndim=2)
     if K.shape != (3, 3):
         raise HTTPException(status_code=400, detail=f"intrinsics must be (3,3); got {K.shape}")
-    seed = int(payload.get("seed", 1))
+    try:
+        seed = int(payload.get("seed", 1))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="seed must be an integer")
     target_faces_raw = payload.get("target_faces")
-    target_faces = int(target_faces_raw) if target_faces_raw is not None else None
+    try:
+        target_faces = int(target_faces_raw) if target_faces_raw is not None else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="target_faces must be an integer")
 
     # The GPU work is synchronous and CPU/GPU-blocking. Run it in the dedicated
     # single-thread executor so this process's event loop stays responsive

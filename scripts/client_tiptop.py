@@ -183,12 +183,14 @@ async def _process_object(
     """
     obj_dir = out_root / f"{i:02d}_{label}"
     try:
-        t0 = time.perf_counter()
+        # Time only the request itself, not the wait for a free semaphore slot,
+        # so round_trip_s reflects server latency rather than client-side queuing.
         async with sem:
+            t0 = time.perf_counter()
             payload = await post_generate(
                 session, args.url, rgb, depth, mask, K, args.seed, args.timeout, args.target_faces
             )
-        elapsed = time.perf_counter() - t0
+            elapsed = time.perf_counter() - t0
     except aiohttp.ClientResponseError as e:
         print(f"[client] [{i:02d}] {label}: HTTP {e.status} — {e.message}")
         return {"index": i, "label": label, "status": "failed", "error": str(e)}

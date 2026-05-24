@@ -32,7 +32,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -64,7 +64,12 @@ class Worker:
 class GatewayState:
     cfg: argparse.Namespace
     workers: List[Worker] = field(default_factory=list)
-    idle: "asyncio.Queue[Worker]" = field(default_factory=asyncio.Queue)
+    # Created in lifespan(), not here: an asyncio.Queue binds to the running loop
+    # the first time it's used, and on Python <3.10 that binding happens at
+    # construction. _state is built in main() before uvicorn starts its loop, so
+    # constructing the queue there would bind the wrong loop. Deferring to
+    # lifespan() (loop already running) is correct on every supported version.
+    idle: Optional["asyncio.Queue[Worker]"] = None
     client: Optional[httpx.AsyncClient] = None
     # Strong refs to in-flight recycle tasks (asyncio may GC unreferenced ones).
     recycle_tasks: set = field(default_factory=set)
@@ -111,6 +116,11 @@ async def _kill_proc(proc: subprocess.Popen) -> None:
             return
         await asyncio.sleep(0.2)
     proc.kill()
+    # Reap it so it doesn't linger as a zombie if no new worker is spawned next.
+    for _ in range(10):  # up to ~1s
+        if proc.poll() is not None:
+            return
+        await asyncio.sleep(0.1)
 
 
 async def _recycle_worker(worker: Worker) -> None:
@@ -185,6 +195,7 @@ async def lifespan(app: FastAPI):
     assert _state is not None
     cfg = _state.cfg
     _state.client = httpx.AsyncClient()
+    _state.idle = asyncio.Queue()  # bind to the now-running event loop
 
     # Staggered startup: bring up the first worker alone and wait for it to load.
     # That one worker populates every shared cache (HF weights *and* the
@@ -273,43 +284,56 @@ async def generate_endpoint(request: Request) -> Response:
     content_type = request.headers.get("content-type", "application/x-msgpack")
 
     tried: List[str] = []
-    # Retry once on a *different* worker if the worker process dies. A crash
-    # (segfault / OOM-kill) OR a poisoned-CUDA-context self-exit both drop the
-    # connection here; either way we recycle that worker (background respawn) and
-    # retry elsewhere. Recoverable inference errors come back as an HTTP error
-    # *status* from a live worker and are forwarded verbatim, not retried.
+    # Retry once on a *different* worker if the worker process dies or stops
+    # responding. A crash (segfault / OOM-kill), a poisoned-CUDA-context
+    # self-exit, or a wedged-but-alive worker that blows the read timeout all
+    # surface here as a network/timeout error; either way we recycle that worker
+    # (background respawn) and retry elsewhere. Recoverable inference errors come
+    # back as an HTTP error *status* from a live worker and are forwarded
+    # verbatim, not retried.
+    #
+    # The acquire→use is wrapped in try/finally so the worker is *never* lost:
+    # it's returned to the idle pool only if it answered and is still alive,
+    # and recycled in every other case (timeout, network error, unexpected
+    # exception, or process exit). Without this an uncaught error would leave a
+    # popped worker neither re-pooled nor recycled, shrinking the pool each time.
     for _ in range(2):
         worker = await _acquire(cfg.queue_timeout)
         t0 = time.perf_counter()
+        requeue = False  # only set True once we have a clean response from a live worker
         try:
-            resp = await _state.client.post(
-                f"{worker.url}/generate",
-                content=body,
-                headers={"Content-Type": content_type},
-                timeout=cfg.request_timeout,
+            try:
+                resp = await _state.client.post(
+                    f"{worker.url}/generate",
+                    content=body,
+                    headers={"Content-Type": content_type},
+                    timeout=cfg.request_timeout,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+                tried.append(worker.label)
+                logger.error("Worker %s request failed (%s); recycling", worker.label, type(e).__name__)
+                continue  # finally recycles this worker; loop retries on another
+            # Worker answered. If its process has since exited (e.g. it
+            # self-exited right after responding due to a poisoned context),
+            # recycle rather than returning a dead worker to the pool.
+            if worker.proc.poll() is not None:
+                logger.error("Worker %s exited after responding (code %s); recycling", worker.label, worker.proc.returncode)
+            else:
+                requeue = True
+            logger.info(
+                "/generate -> %s  status=%d  proxy=%.3fs  req_bytes=%d resp_bytes=%d",
+                worker.label, resp.status_code, time.perf_counter() - t0, len(body), len(resp.content),
             )
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectTimeout) as e:
-            tried.append(worker.label)
-            logger.error("Worker %s connection failed (%s); recycling", worker.label, type(e).__name__)
-            _schedule_recycle(worker)
-            continue
-        # Worker answered. If its process has since exited (e.g. it self-exited
-        # right after responding due to a poisoned context), recycle rather than
-        # returning a dead worker to the pool.
-        if worker.proc.poll() is not None:
-            logger.error("Worker %s exited after responding (code %s); recycling", worker.label, worker.proc.returncode)
-            _schedule_recycle(worker)
-        else:
-            _state.idle.put_nowait(worker)
-        logger.info(
-            "/generate -> %s  status=%d  proxy=%.3fs  req_bytes=%d resp_bytes=%d",
-            worker.label, resp.status_code, time.perf_counter() - t0, len(body), len(resp.content),
-        )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/x-msgpack"),
-        )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/x-msgpack"),
+            )
+        finally:
+            if requeue:
+                _state.idle.put_nowait(worker)
+            else:
+                _schedule_recycle(worker)
 
     raise HTTPException(status_code=502, detail=f"all attempted workers failed: {tried}")
 
