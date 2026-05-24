@@ -46,10 +46,19 @@ logger = logging.getLogger("recgen_inference.gateway")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
+_PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
+
 # Load libc once at import (not inside the post-fork child, where allocating /
 # locking would be unsafe) for the PR_SET_PDEATHSIG call below.
 try:
     _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    # prctl is declared `int prctl(int, ...)`; glibc still reads 5 args via
+    # va_arg and forwards them to the syscall, so we must pass all 5 explicitly
+    # (otherwise args 3-5 are whatever garbage is in registers). Declare the
+    # full fixed signature so the call is well-defined, not reliant on the
+    # kernel happening to ignore those args for PR_SET_PDEATHSIG.
+    _libc.prctl.restype = ctypes.c_int
+    _libc.prctl.argtypes = [ctypes.c_int] * 5
 except OSError:
     _libc = None
 
@@ -63,7 +72,7 @@ def _die_with_parent() -> None:
     port. Best-effort: a no-op where libc/prctl isn't available.
     """
     if _libc is not None:
-        _libc.prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+        _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
 
 
 @dataclass
