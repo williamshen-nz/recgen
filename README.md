@@ -55,6 +55,87 @@ docker compose run --rm recgen bash
 
 </details>
 
+## Inference Server (HTTP)
+
+Run RecGen as an HTTP service that fans single-view reconstruction requests
+across every available GPU. It works just as well on a single-GPU machine — the
+gateway spawns one model-holding worker per detected GPU and load-balances across
+them, so one GPU simply means one worker. Requests and responses are msgpack
+blobs carrying numpy arrays directly (no PNG round-trip).
+
+> Prefer to embed RecGen in your own Python process instead of calling it over
+> HTTP? See [Quick Start](#quick-start) below for the in-process API.
+
+### Start the server
+
+```bash
+pixi run server                              # auto-detect all GPUs, public :18324
+pixi run server --gpus 0,1,2,3 --port 18324  # pin the GPU set / port explicitly
+```
+
+`pixi run server` starts a **gateway** that spawns one GPU-pinned worker process
+per GPU (auto-detected from `CUDA_VISIBLE_DEVICES`, else `nvidia-smi`) behind a
+single `/generate` endpoint. Each request is dispatched to an idle GPU; when all
+GPUs are busy, requests queue FIFO and fall back to `503` after `--queue-timeout`.
+The client only ever talks to the gateway — the multi-GPU fan-out is transparent.
+To actually use more than one GPU the client must send requests **concurrently**
+(the async `scripts/client_tiptop.py` does this); a client looping one request at
+a time keeps only one GPU busy.
+
+The **first** start downloads model weights (several GB) and warms shared caches,
+so it can take a few minutes; startup is staggered (one worker loads first to
+populate the HuggingFace + `torch.hub`/DINOv2 caches, then the rest load from
+cache) so a cold machine does a single download pass instead of N workers racing.
+Subsequent starts load straight from cache. Watch for `Gateway ready: N worker(s)`.
+
+### Configuration
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--gpus` | auto | Comma-separated GPU ids, one worker each (e.g. `0,1,2,3`). Auto-detected if omitted. |
+| `--port` | `18324` | Public gateway port (binds `0.0.0.0`, so reachable from other machines). |
+| `--checkpoint` | `recgen_base.multiview_stereo` | RecGen checkpoint, passed to every worker. |
+| `--queue-timeout` | `300` s | Max wait for a free GPU before returning `503`. |
+| `--request-timeout` | `600` s | Max time for one worker `/generate` to complete. |
+| `--worker-startup-timeout` | `600` s | Max wait per worker to load its pipeline at boot. |
+| `--worker-base-port` | `18401` | First internal worker port (worker *i* → `base+i`, localhost only). |
+
+### Endpoints
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /generate` | one object: msgpack `{rgb, depth, mask, intrinsics, seed?, target_faces?}` → `{vertices, faces, vertex_colors?, pose_matrix, pose_quat}` |
+| `GET /health` | gateway status + `pipeline_loaded` / `workers_total` / `workers_alive` / `workers_idle` |
+
+### Querying the server
+
+Check it's up (replace `<host>` with the server's hostname/IP, or `localhost`):
+
+```bash
+curl -s http://<host>:18324/health
+# {"status":"ok","pipeline_loaded":true,"workers_total":1,"workers_alive":1,"workers_idle":1,...}
+```
+
+The included demo client reconstructs every object in a capture, fanning the
+requests across GPUs:
+
+```bash
+pixi run python scripts/client_tiptop.py \
+    --root data/tiptop/<capture> \
+    --url http://<host>:18324 \
+    --concurrency 4               # max in-flight requests; set near the GPU count
+```
+
+The client is torch-free (numpy/opencv/aiohttp/msgpack/trimesh only), so it can
+run on a laptop while the server holds the GPUs. See `scripts/client_tiptop.py`
+for the msgpack wire format if you're writing your own client.
+
+> A worker that crashes (segfault/OOM-kill) or wedges its CUDA context is
+> recycled automatically: the in-flight request retries on another GPU while the
+> dead worker respawns in the background (its GPU rejoins the pool once the fresh
+> pipeline finishes loading). A worker detects an unrecoverable CUDA context
+> itself and self-exits so the gateway can replace it.
+
 ## Quick Start
 
 ```python
@@ -131,44 +212,6 @@ The result is expressed in the anchor view's camera frame.
 ## Viewing Gaussian Splats
 
 The `gaussian.ply` produced with `--save-splat` is compatible with [SuperSplat](https://superspl.at/editor), a browser-based viewer and editor. Drag the file into the editor window — no upload or install required, everything runs locally in the browser. SuperSplat is also useful for cropping, cleaning, and re-exporting splats (`.ply`, `.splat`, or compressed `.ply`).
-
-## Serving (HTTP)
-
-Run RecGen as an HTTP service. Requests and responses are msgpack blobs carrying
-numpy arrays directly (no PNG round-trip); see `scripts/client_tiptop.py` for a
-client example.
-
-```bash
-pixi run server                              # gateway: one worker per GPU, public :18324
-pixi run server --gpus 0,1,2,3 --port 18324  # pin the GPU set explicitly
-```
-
-`pixi run server` starts a **gateway** that spawns one GPU-pinned worker process
-per GPU (auto-detected from `CUDA_VISIBLE_DEVICES`, else `nvidia-smi`) and
-exposes a single `/generate` endpoint. Each request is dispatched to an idle
-GPU; when all GPUs are busy, requests queue FIFO and fall back to `503` after
-`--queue-timeout` (default 300 s). The client only ever talks to the gateway —
-the multi-GPU fan-out is transparent. To fan out, the client must send requests
-**concurrently** (the async `scripts/client_tiptop.py` does this); a single
-client looping one request at a time will only ever use one GPU.
-
-Startup is staggered: one worker loads first to warm the shared weight caches
-(HF + the `torch.hub`/DINOv2 download), then the rest load from cache — so a cold
-machine does a single download pass instead of N workers racing.
-
-| Endpoint | Description |
-| --- | --- |
-| `POST /generate` | one object: msgpack `{rgb, depth, mask, intrinsics, seed?, target_faces?}` → `{vertices, faces, vertex_colors?, pose_matrix, pose_quat}` |
-| `GET /health` | gateway status + `workers_total` / `workers_alive` / `workers_idle` |
-
-For single-GPU debugging, run one worker directly (no gateway):
-`pixi run python scripts/server.py --port 18324`.
-
-> A worker that crashes (segfault/OOM-kill) or wedges its CUDA context is
-> recycled automatically: the in-flight request retries on another GPU while the
-> dead worker respawns in the background (its GPU rejoins the pool once the fresh
-> pipeline finishes loading). A worker detects an unrecoverable CUDA context
-> itself and self-exits so the gateway can replace it.
 
 ## Troubleshooting
 
