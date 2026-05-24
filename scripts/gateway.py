@@ -115,6 +115,7 @@ async def _kill_proc(proc: subprocess.Popen) -> None:
         if proc.poll() is not None:
             return
         await asyncio.sleep(0.2)
+    logger.warning("Process %s did not exit on SIGTERM; killing", proc.pid)
     proc.kill()
     # Reap it so it doesn't linger as a zombie if no new worker is spawned next.
     for _ in range(10):  # up to ~1s
@@ -174,16 +175,11 @@ async def _await_ready(client: httpx.AsyncClient, worker: Worker, timeout: float
     return False
 
 
-def _terminate_workers(workers: List[Worker]) -> None:
-    for w in workers:
-        if w.proc.poll() is None:
-            w.proc.terminate()
-    for w in workers:
-        try:
-            w.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            logger.warning("Worker %s did not exit; killing", w.label)
-            w.proc.kill()
+async def _terminate_workers(workers: List[Worker]) -> None:
+    # Reuse the async _kill_proc (graceful SIGTERM -> wait -> SIGKILL -> reap) for
+    # every worker in parallel, so shutdown never blocks the event loop and no
+    # killed child is left unreaped.
+    await asyncio.gather(*(_kill_proc(w.proc) for w in workers))
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +217,7 @@ async def lifespan(app: FastAPI):
         _state.idle.put_nowait(w)
 
     if not ready:
-        _terminate_workers(_state.workers)
+        await _terminate_workers(_state.workers)
         await _state.client.aclose()
         raise RuntimeError("No workers became ready; aborting gateway startup.")
     if len(ready) < len(_state.workers):
@@ -232,7 +228,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("Shutting down workers...")
-        _terminate_workers(_state.workers)
+        await _terminate_workers(_state.workers)
         if _state.client is not None:
             await _state.client.aclose()
 

@@ -62,12 +62,19 @@ def _cuda_context_broken() -> bool:
     intact. We test with a trivial op so the caller can tell "retry me later" /
     "I'm wedged, kill me" apart.
     """
+    device = _state.get("device") or "cuda"
+    # Only a CUDA context can get wedged; a CPU worker has nothing to probe (and
+    # we don't want to spin up a CUDA context just to check). Probe the worker's
+    # *configured* device so a non-default --device cuda:N isn't checked as cuda:0.
+    if not str(device).startswith("cuda"):
+        return False
     try:
         if not torch.cuda.is_available():
             return False
-        torch.cuda.synchronize()
-        _ = (torch.zeros(8, device="cuda") + 1).sum().item()
-        torch.cuda.synchronize()
+        dev = torch.device(device)
+        torch.cuda.synchronize(dev)
+        _ = (torch.zeros(8, device=dev) + 1).sum().item()
+        torch.cuda.synchronize(dev)
         return False
     except Exception:
         return True
@@ -327,7 +334,9 @@ def main() -> None:
     _state["checkpoint"] = args.checkpoint
     _state["device"] = args.device
 
-    prefix = f"[{args.worker_label}] " if args.worker_label else ""
+    # Escape % so a label containing one isn't read as a logging format directive.
+    safe_label = args.worker_label.replace("%", "%%")
+    prefix = f"[{safe_label}] " if args.worker_label else ""
     logging.basicConfig(
         level=args.log_level.upper(),
         format=f"%(asctime)s %(levelname)s %(name)s {prefix}%(message)s",
