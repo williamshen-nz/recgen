@@ -16,7 +16,7 @@ the client side changes.
 
 Run with::
 
-    pixi run serve                       # auto-detects GPUs
+    pixi run server                      # auto-detects GPUs
     pixi run python scripts/gateway.py --gpus 0,1,2,3 --port 18324
 """
 
@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import itertools
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -43,6 +45,25 @@ logger = logging.getLogger("recgen_inference.gateway")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_SCRIPT = Path(__file__).resolve().parent / "server.py"
+
+# Load libc once at import (not inside the post-fork child, where allocating /
+# locking would be unsafe) for the PR_SET_PDEATHSIG call below.
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+except OSError:
+    _libc = None
+
+
+def _die_with_parent() -> None:
+    """preexec_fn: ask the kernel to SIGTERM this worker if the gateway dies.
+
+    lifespan's shutdown only reaps workers on a *graceful* exit. If the gateway
+    is SIGKILLed or crashes, this (Linux PR_SET_PDEATHSIG=1) ensures the worker
+    still gets a SIGTERM instead of being orphaned holding GPU memory and its
+    port. Best-effort: a no-op where libc/prctl isn't available.
+    """
+    if _libc is not None:
+        _libc.prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
 
 
 @dataclass
@@ -103,7 +124,9 @@ def _start_proc(cfg: argparse.Namespace, gpu: str, port: int, label: str) -> sub
     ]
     logger.info("Spawning worker %s on port %d (CUDA_VISIBLE_DEVICES=%s)", label, port, gpu)
     # Inherit stdout/stderr so worker logs (prefixed with [gpuN]) interleave here.
-    return subprocess.Popen(cmd, env=env, cwd=str(REPO_ROOT))
+    # preexec_fn ties the worker's lifetime to ours: if the gateway dies hard
+    # (SIGKILL/crash), the kernel SIGTERMs the worker so it can't be orphaned.
+    return subprocess.Popen(cmd, env=env, cwd=str(REPO_ROOT), preexec_fn=_die_with_parent)
 
 
 def _spawn_worker(cfg: argparse.Namespace, gpu: str, port: int) -> Worker:

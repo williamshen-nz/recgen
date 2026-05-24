@@ -2,7 +2,7 @@
 
 Spin up the server in one shell, then point this client at it::
 
-    pixi run serve                                   # shell A: gateway on :18324
+    pixi run server                                  # shell A: gateway on :18324
     pixi run python scripts/client_tiptop.py \\      # shell B: client
         --root data/tiptop/2026-04-29_10-29-39
 
@@ -15,8 +15,8 @@ real downstream client: the objects in a capture are POSTed **concurrently**,
 bounded by ``--concurrency`` (default 4) via a semaphore. The gateway hands each
 request to an idle GPU and queues the rest, so a multi-object capture fans out
 across all GPUs instead of running serially. Point ``--url`` at the gateway
-(default ``:18324``); a single-GPU ``serve-worker`` works too, it just
-serializes. Wire format is msgpack (numpy arrays via msgpack-numpy) in both
+(default ``:18324``); pointing it directly at a single ``scripts/server.py``
+worker works too, it just serializes. Wire format is msgpack (numpy arrays via msgpack-numpy) in both
 directions — no PNG round-trip. For each object we save the returned mesh + pose;
 optionally merge per-object meshes into a scene OBJ.
 """

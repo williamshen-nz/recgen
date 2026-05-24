@@ -118,7 +118,6 @@ cu118 = { features = ["base", "cu118", "glb", "vis"], solve-group = "cu118" }
 # ── Tasks ────────────────────────────────────────────────────────────────
 [tasks]
 post-install = { cmd = "python -m pip install psutil packaging && CUDA_HOME=$CONDA_PREFIX python -m pip install --no-build-isolation flash-attn || echo 'flash-attn skipped, will use SDPA fallback'", description = "Install flash-attn (optional)" }
-serve = { cmd = "python scripts/gateway.py", description = "Start the multi-GPU gateway (one worker per GPU)" }
-serve-worker = { cmd = "python scripts/server.py", description = "Start a single-GPU inference worker (debugging)" }
+server = { cmd = "python scripts/gateway.py", description = "Start the multi-GPU gateway (one worker per GPU)" }
 build-nvdiffrast = { cmd = "CUDA_HOME=$CONDA_PREFIX bash scripts/setup_cuda.sh --nvdiffrast", description = "Build nvdiffrast from source (needed for GLB export)" }
 build-gaussian-rasterizer = { cmd = "CUDA_HOME=$CONDA_PREFIX bash scripts/setup_cuda.sh --diff-gaussian", description = "Build diff_gaussian_rasterization from source (needed for GLB export)" }

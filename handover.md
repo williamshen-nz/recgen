@@ -10,7 +10,7 @@ onto the 4-GPU box.
 ```bash
 git checkout will/multi-gpu
 pixi install                 # pulls httpx + aiohttp into the lock/env
-pixi run serve               # auto-detects all GPUs -> one worker each, public :18324
+pixi run server              # auto-detects all GPUs -> one worker each, public :18324
 ```
 
 Clients keep talking to a single URL (`http://<host>:18324`); the multi-GPU
@@ -128,7 +128,7 @@ Captured here so the next person doesn't re-litigate them.
 | `scripts/gateway.py` | **New.** Supervisor + dispatcher: staggered worker startup (warms caches), idle-queue routing, health, retry, background recycle of dead/poisoned workers; quiets httpx logs. |
 | `scripts/server.py` | Per-GPU worker. `generate()` moved off the event loop into a single-thread executor; self-exits on a wedged CUDA context so the gateway respawns it; quiets HF/httpx logs + spconv warnings; added `--worker-label`. |
 | `scripts/client_tiptop.py` | Demo client rewritten async (`aiohttp` + semaphore, `--concurrency` default 4) to fan out across GPUs; added `--target-faces`; default URL → `:18324`. |
-| `pixi.toml` | Added `httpx` + `aiohttp`; `serve` now launches the gateway; new `serve-worker` task for single-GPU debugging. |
+| `pixi.toml` | Added `httpx` + `aiohttp`; the `server` task now launches the gateway (was the single-GPU `serve`). |
 | `pyproject.toml` | Added `httpx>=0.27`, `aiohttp>=3.9`. |
 | `README.md` | New "Serving (HTTP)" section. |
 
@@ -149,9 +149,9 @@ Captured here so the next person doesn't re-litigate them.
 
 3. **Start the service**
    ```bash
-   pixi run serve                          # all detected GPUs
+   pixi run server                         # all detected GPUs
    # or pin explicitly / change port:
-   pixi run serve --gpus 0,1,2,3 --port 18324
+   pixi run server --gpus 0,1,2,3 --port 18324
    ```
    Startup is **staggered**: the gateway brings up one worker first
    (`Bringing up gpu0 first to warm the weight caches...`) and waits for it to
@@ -238,5 +238,6 @@ confirm on the 4-GPU workstation:
 
 ## Rollback
 
-The old single-GPU behavior is preserved: `pixi run serve-worker` runs one
-`scripts/server.py` on `:18324` exactly as before. Or `git checkout main`.
+The old single-GPU behavior is still available by running a worker directly:
+`pixi run python scripts/server.py --port 18324` serves one `scripts/server.py`
+on `:18324` exactly as before. Or `git checkout main`.

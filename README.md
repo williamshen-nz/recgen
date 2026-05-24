@@ -139,11 +139,11 @@ numpy arrays directly (no PNG round-trip); see `scripts/client_tiptop.py` for a
 client example.
 
 ```bash
-pixi run serve                              # gateway: one worker per GPU, public :18324
-pixi run serve --gpus 0,1,2,3 --port 18324  # pin the GPU set explicitly
+pixi run server                              # gateway: one worker per GPU, public :18324
+pixi run server --gpus 0,1,2,3 --port 18324  # pin the GPU set explicitly
 ```
 
-`pixi run serve` starts a **gateway** that spawns one GPU-pinned worker process
+`pixi run server` starts a **gateway** that spawns one GPU-pinned worker process
 per GPU (auto-detected from `CUDA_VISIBLE_DEVICES`, else `nvidia-smi`) and
 exposes a single `/generate` endpoint. Each request is dispatched to an idle
 GPU; when all GPUs are busy, requests queue FIFO and fall back to `503` after
@@ -161,8 +161,8 @@ machine does a single download pass instead of N workers racing.
 | `POST /generate` | one object: msgpack `{rgb, depth, mask, intrinsics, seed?, target_faces?}` → `{vertices, faces, vertex_colors?, pose_matrix, pose_quat}` |
 | `GET /health` | gateway status + `workers_total` / `workers_alive` / `workers_idle` |
 
-For single-GPU debugging, `pixi run serve-worker` runs one worker directly
-(no gateway) on `:18324`.
+For single-GPU debugging, run one worker directly (no gateway):
+`pixi run python scripts/server.py --port 18324`.
 
 > A worker that crashes (segfault/OOM-kill) or wedges its CUDA context is
 > recycled automatically: the in-flight request retries on another GPU while the

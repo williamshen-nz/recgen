@@ -6,8 +6,6 @@ blobs carrying numpy arrays directly (via msgpack-numpy) — no PNG round-trip.
 
 Run with::
 
-    pixi run serve
-    # or
     pixi run python scripts/server.py --host 0.0.0.0 --port 18324
 """
 
