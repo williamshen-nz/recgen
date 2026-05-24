@@ -86,7 +86,7 @@ The **first** start downloads model weights (several GB) and warms shared caches
 so it can take a few minutes; startup is staggered (one worker loads first to
 populate the HuggingFace + `torch.hub`/DINOv2 caches, then the rest load from
 cache) so a cold machine does a single download pass instead of N workers racing.
-Subsequent starts load straight from cache. Watch for `Gateway ready: N worker(s)`.
+Subsequent starts load straight from cache. Watch for the `RecGen gateway READY` banner.
 
 ### Configuration
 
