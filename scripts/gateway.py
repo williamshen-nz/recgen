@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import logging
 import os
 import subprocess
@@ -76,6 +77,10 @@ class GatewayState:
 
 
 _state: Optional[GatewayState] = None
+
+# Monotonic per-request id so concurrent requests stay distinguishable in the
+# interleaved logs (the event loop is single-threaded, so next() is race-free).
+_req_counter = itertools.count(1)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +284,13 @@ async def generate_endpoint(request: Request) -> Response:
     body = await request.body()
     content_type = request.headers.get("content-type", "application/x-msgpack")
 
+    req_id = next(_req_counter)
+    t_arrival = time.perf_counter()
+    logger.info(
+        "req#%d arrived  body=%d bytes  idle=%d/%d workers free",
+        req_id, len(body), _state.idle.qsize(), len(_alive_workers()),
+    )
+
     tried: List[str] = []
     # Retry once on a *different* worker if the worker process dies or stops
     # responding. A crash (segfault / OOM-kill), a poisoned-CUDA-context
@@ -294,7 +306,16 @@ async def generate_endpoint(request: Request) -> Response:
     # exception, or process exit). Without this an uncaught error would leave a
     # popped worker neither re-pooled nor recycled, shrinking the pool each time.
     for _ in range(2):
+        # Pop a free GPU off the idle queue, FIFO-waiting if all are busy. The
+        # wait time below is how long this request sat queued behind others.
+        if _state.idle.empty():
+            logger.info("req#%d queued  all %d worker(s) busy", req_id, len(_alive_workers()))
+        t_wait = time.perf_counter()
         worker = await _acquire(cfg.queue_timeout)
+        logger.info(
+            "req#%d -> %s  acquired after %.3fs wait  idle now=%d",
+            req_id, worker.label, time.perf_counter() - t_wait, _state.idle.qsize(),
+        )
         t0 = time.perf_counter()
         requeue = False  # only set True once we have a clean response from a live worker
         try:
@@ -307,18 +328,19 @@ async def generate_endpoint(request: Request) -> Response:
                 )
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
                 tried.append(worker.label)
-                logger.error("Worker %s request failed (%s); recycling", worker.label, type(e).__name__)
+                logger.error("req#%d worker %s request failed (%s); recycling", req_id, worker.label, type(e).__name__)
                 continue  # finally recycles this worker; loop retries on another
             # Worker answered. If its process has since exited (e.g. it
             # self-exited right after responding due to a poisoned context),
             # recycle rather than returning a dead worker to the pool.
             if worker.proc.poll() is not None:
-                logger.error("Worker %s exited after responding (code %s); recycling", worker.label, worker.proc.returncode)
+                logger.error("req#%d worker %s exited after responding (code %s); recycling", req_id, worker.label, worker.proc.returncode)
             else:
                 requeue = True
             logger.info(
-                "/generate -> %s  status=%d  proxy=%.3fs  req_bytes=%d resp_bytes=%d",
-                worker.label, resp.status_code, time.perf_counter() - t0, len(body), len(resp.content),
+                "req#%d done on %s  status=%d  proxy=%.3fs  total=%.3fs  req_bytes=%d resp_bytes=%d",
+                req_id, worker.label, resp.status_code, time.perf_counter() - t0,
+                time.perf_counter() - t_arrival, len(body), len(resp.content),
             )
             return Response(
                 content=resp.content,
@@ -331,6 +353,7 @@ async def generate_endpoint(request: Request) -> Response:
             else:
                 _schedule_recycle(worker)
 
+    logger.error("req#%d failed on all attempted workers: %s", req_id, tried)
     raise HTTPException(status_code=502, detail=f"all attempted workers failed: {tried}")
 
 
