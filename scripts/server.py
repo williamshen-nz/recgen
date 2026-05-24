@@ -6,26 +6,33 @@ blobs carrying numpy arrays directly (via msgpack-numpy) — no PNG round-trip.
 
 Run with::
 
-    pixi run serve
-    # or
-    pixi run python scripts/server.py --host 0.0.0.0 --port 7324
+    pixi run python scripts/server.py --host 0.0.0.0 --port 18324
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
+import functools
 import logging
 import os
 import time
+import warnings
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 os.environ.setdefault("SPCONV_ALGO", "native")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
+# spconv spams a FutureWarning per kernel about torch.cuda.amp.custom_fwd/bwd
+# being deprecated. It fires on import below, so silence it before that.
+warnings.filterwarnings("ignore", message=r".*torch\.cuda\.amp\.custom_(fwd|bwd).*")
+
 import msgpack
 import msgpack_numpy
 import numpy as np
+import torch
 import trimesh
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -36,6 +43,49 @@ from recgen_inference._result import RecGenResult
 msgpack_numpy.patch()  # teach msgpack to encode/decode np.ndarray natively
 
 logger = logging.getLogger("recgen_inference.server")
+
+# A single worker thread: the heavy generate() call runs off the event loop
+# (so /health stays responsive) but generations are serialized within this
+# process, so the one pipeline/GPU is never driven by two threads at once —
+# even if this worker is hit concurrently outside the gateway.
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def _cuda_context_broken() -> bool:
+    """Probe whether this process's CUDA context is still usable.
+
+    Some failures (device-side assert, illegal memory access) corrupt the CUDA
+    context: the process keeps running but every subsequent op raises. A clean
+    error (bad input, CPU-side exception, recoverable OOM) leaves the context
+    intact. We test with a trivial op so the caller can tell "retry me later" /
+    "I'm wedged, kill me" apart.
+    """
+    device = _state.get("device") or "cuda"
+    # Only a CUDA context can get wedged; a CPU worker has nothing to probe (and
+    # we don't want to spin up a CUDA context just to check). Probe the worker's
+    # *configured* device so a non-default --device cuda:N isn't checked as cuda:0.
+    if not str(device).startswith("cuda"):
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        dev = torch.device(device)
+        torch.cuda.synchronize(dev)
+        _ = (torch.zeros(8, device=dev) + 1).sum().item()
+        torch.cuda.synchronize(dev)
+        return False
+    except Exception:
+        return True
+
+
+def _hard_exit(code: int = 70) -> None:
+    """Flush logs and terminate the process so the gateway respawns this worker."""
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    os._exit(code)
 
 _state: Dict[str, Any] = {"pipeline": None, "checkpoint": None, "device": None}
 
@@ -51,6 +101,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         _state["pipeline"] = None
+        # Tear down the generate() worker thread so the process can exit cleanly
+        # (the non-daemon thread would otherwise keep it alive on shutdown).
+        _executor.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(
@@ -119,6 +172,40 @@ def _pack_result(result: RecGenResult) -> bytes:
     return msgpack.packb(payload, use_bin_type=True)
 
 
+def _run_generate(
+    pipeline: Any,
+    rgb_arr: np.ndarray,
+    depth_arr: np.ndarray,
+    mask_arr: np.ndarray,
+    K: np.ndarray,
+    seed: int,
+    target_faces: int | None,
+) -> tuple[bytes, float, float]:
+    """Blocking inference + optional decimation + serialization.
+
+    Returns ``(response_body, inference_s, decimation_s)``. Runs in a worker
+    thread (see ``run_in_executor`` in the endpoint), never on the event loop.
+    """
+    t_inf = time.perf_counter()
+    result = generate(
+        pipeline,
+        image=rgb_arr,
+        depth=depth_arr,
+        mask=mask_arr,
+        intrinsics=K,
+        seed=seed,
+    )
+    inference_s = time.perf_counter() - t_inf
+
+    decimation_s = 0.0
+    if target_faces is not None and target_faces > 0:
+        t_dec = time.perf_counter()
+        result.mesh = _decimate_mesh(result.mesh, target_faces)
+        decimation_s = time.perf_counter() - t_dec
+
+    return _pack_result(result), inference_s, decimation_s
+
+
 def _ensure_pipeline():
     pipeline = _state.get("pipeline")
     if pipeline is None:
@@ -169,28 +256,44 @@ async def generate_endpoint(request: Request) -> Response:
     K = _require_array(payload, "intrinsics", ndim=2)
     if K.shape != (3, 3):
         raise HTTPException(status_code=400, detail=f"intrinsics must be (3,3); got {K.shape}")
-    seed = int(payload.get("seed", 1))
+    try:
+        seed = int(payload.get("seed", 1))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="seed must be an integer")
     target_faces_raw = payload.get("target_faces")
-    target_faces = int(target_faces_raw) if target_faces_raw is not None else None
+    try:
+        target_faces = int(target_faces_raw) if target_faces_raw is not None else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="target_faces must be an integer")
 
-    t_inf = time.perf_counter()
-    result = generate(
-        pipeline,
-        image=rgb_arr,
-        depth=depth_arr,
-        mask=mask_arr,
-        intrinsics=K,
-        seed=seed,
-    )
-    inference_s = time.perf_counter() - t_inf
-
-    decimation_s = 0.0
-    if target_faces is not None and target_faces > 0:
-        t_dec = time.perf_counter()
-        result.mesh = _decimate_mesh(result.mesh, target_faces)
-        decimation_s = time.perf_counter() - t_dec
-
-    response_body = _pack_result(result)
+    # The GPU work is synchronous and CPU/GPU-blocking. Run it in the dedicated
+    # single-thread executor so this process's event loop stays responsive
+    # (/health keeps answering, the gateway can probe liveness) while keeping
+    # generations serialized — the one pipeline/GPU is never driven concurrently.
+    loop = asyncio.get_running_loop()
+    try:
+        response_body, inference_s, decimation_s = await loop.run_in_executor(
+            _executor,
+            functools.partial(
+                _run_generate,
+                pipeline,
+                rgb_arr,
+                depth_arr,
+                mask_arr,
+                K,
+                seed,
+                target_faces,
+            ),
+        )
+    except Exception as e:
+        # If the CUDA context is now wedged, this worker is useless for every
+        # future request — exit hard so the gateway respawns us with a fresh
+        # context. Otherwise it was a recoverable error: report it and stay up.
+        if await loop.run_in_executor(_executor, _cuda_context_broken):
+            logger.error("CUDA context unusable after %s; exiting for respawn: %s", type(e).__name__, e)
+            _hard_exit()
+        logger.exception("generation failed (recoverable)")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
     total_s = time.perf_counter() - t_start
     logger.info(
         "/generate ok  inference=%.3fs  decimation=%.3fs  total=%.3fs  rgb=%s depth=%s target_faces=%s req_bytes=%d resp_bytes=%d",
@@ -211,7 +314,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Serve RecGen as a FastAPI app")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=7324)
+    parser.add_argument("--port", type=int, default=18324)
     parser.add_argument(
         "--checkpoint",
         default="recgen_base.multiview_stereo",
@@ -219,12 +322,27 @@ def main() -> None:
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--worker-label",
+        default=os.environ.get("RECGEN_WORKER_LABEL", ""),
+        help="Optional prefix for log lines (set by the gateway, e.g. 'gpu0').",
+    )
     args = parser.parse_args()
 
     _state["checkpoint"] = args.checkpoint
     _state["device"] = args.device
 
-    logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # Escape % so a label containing one isn't read as a logging format directive.
+    safe_label = args.worker_label.replace("%", "%%")
+    prefix = f"[{safe_label}] " if args.worker_label else ""
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format=f"%(asctime)s %(levelname)s %(name)s {prefix}%(message)s",
+    )
+    # Hugging Face Hub (httpx-based in v1.x) logs a line per cache HEAD-check on
+    # every model file at load time — pure noise. Quiet the HTTP/cache loggers.
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "filelock", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, workers=1)
 
 

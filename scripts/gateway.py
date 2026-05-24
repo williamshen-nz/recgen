@@ -1,0 +1,507 @@
+"""Multi-GPU gateway for RecGen inference.
+
+Spawns one ``scripts/server.py`` worker per GPU (each pinned via
+``CUDA_VISIBLE_DEVICES`` and holding its own pipeline), then exposes a single
+public ``/generate`` endpoint that dispatches each request to an *idle* worker.
+
+Routing is an ``asyncio.Queue`` of idle worker URLs: every request pops a
+genuinely-free GPU (not blind round-robin), proxies the msgpack body to it over
+localhost, and returns the worker to the pool when done. When all GPUs are
+busy, requests wait FIFO (fair across concurrent clients); past
+``--queue-timeout`` they get a 503 instead of piling up unbounded.
+
+The client speaks to this gateway exactly as it spoke to a single server — same
+``/generate`` and ``/health`` contract, same msgpack wire format — so nothing on
+the client side changes.
+
+Run with::
+
+    pixi run server                      # auto-detects GPUs
+    pixi run python scripts/gateway.py --gpus 0,1,2,3 --port 18324
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ctypes
+import itertools
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+
+logger = logging.getLogger("recgen_inference.gateway")
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+WORKER_SCRIPT = Path(__file__).resolve().parent / "server.py"
+
+_PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
+
+# Load libc once at import (not inside the post-fork child, where allocating /
+# locking would be unsafe) for the PR_SET_PDEATHSIG call below.
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    # prctl is declared `int prctl(int, ...)`; glibc still reads 5 args via
+    # va_arg and forwards them to the syscall, so we must pass all 5 explicitly
+    # (otherwise args 3-5 are whatever garbage is in registers). Declare the
+    # full fixed signature so the call is well-defined, not reliant on the
+    # kernel happening to ignore those args for PR_SET_PDEATHSIG.
+    _libc.prctl.restype = ctypes.c_int
+    _libc.prctl.argtypes = [ctypes.c_int] * 5
+except OSError:
+    _libc = None
+
+
+def _die_with_parent() -> None:
+    """preexec_fn: ask the kernel to SIGTERM this worker if the gateway dies.
+
+    lifespan's shutdown only reaps workers on a *graceful* exit. If the gateway
+    is SIGKILLed or crashes, this (Linux PR_SET_PDEATHSIG=1) ensures the worker
+    still gets a SIGTERM instead of being orphaned holding GPU memory and its
+    port. Best-effort: a no-op where libc/prctl isn't available.
+    """
+    if _libc is not None:
+        _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
+
+
+@dataclass
+class Worker:
+    """One GPU-pinned ``server.py`` subprocess."""
+
+    label: str
+    gpu: str
+    port: int
+    proc: subprocess.Popen
+    alive: bool = True
+    recycling: bool = False  # guards against starting two respawns at once
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+
+@dataclass
+class GatewayState:
+    cfg: argparse.Namespace
+    workers: List[Worker] = field(default_factory=list)
+    # Created in lifespan(), not here: an asyncio.Queue binds to the running loop
+    # the first time it's used, and on Python <3.10 that binding happens at
+    # construction. _state is built in main() before uvicorn starts its loop, so
+    # constructing the queue there would bind the wrong loop. Deferring to
+    # lifespan() (loop already running) is correct on every supported version.
+    idle: Optional["asyncio.Queue[Worker]"] = None
+    client: Optional[httpx.AsyncClient] = None
+    # Strong refs to in-flight recycle tasks (asyncio may GC unreferenced ones).
+    recycle_tasks: set = field(default_factory=set)
+
+
+_state: Optional[GatewayState] = None
+
+# Monotonic per-request id so concurrent requests stay distinguishable in the
+# interleaved logs (the event loop is single-threaded, so next() is race-free).
+_req_counter = itertools.count(1)
+
+
+# ---------------------------------------------------------------------------
+# Worker lifecycle
+# ---------------------------------------------------------------------------
+
+def _start_proc(cfg: argparse.Namespace, gpu: str, port: int, label: str) -> subprocess.Popen:
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = gpu
+    env["RECGEN_WORKER_LABEL"] = label
+    cmd = [
+        sys.executable,
+        str(WORKER_SCRIPT),
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--checkpoint", cfg.checkpoint,
+        # Exactly one GPU is visible to the worker, so plain "cuda" == that GPU.
+        "--device", "cuda",
+        "--log-level", cfg.log_level,
+    ]
+    logger.info("Spawning worker %s on port %d (CUDA_VISIBLE_DEVICES=%s)", label, port, gpu)
+    # Inherit stdout/stderr so worker logs (prefixed with [gpuN]) interleave here.
+    # preexec_fn ties the worker's lifetime to ours: if the gateway dies hard
+    # (SIGKILL/crash), the kernel SIGTERMs the worker so it can't be orphaned.
+    return subprocess.Popen(cmd, env=env, cwd=str(REPO_ROOT), preexec_fn=_die_with_parent)
+
+
+def _spawn_worker(cfg: argparse.Namespace, gpu: str, port: int) -> Worker:
+    label = f"gpu{gpu}"
+    return Worker(label=label, gpu=gpu, port=port, proc=_start_proc(cfg, gpu, port, label))
+
+
+async def _kill_proc(proc: subprocess.Popen) -> None:
+    """Terminate a process without blocking the event loop."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    for _ in range(50):  # up to ~10s
+        if proc.poll() is not None:
+            return
+        await asyncio.sleep(0.2)
+    logger.warning("Process %s did not exit on SIGTERM; killing", proc.pid)
+    proc.kill()
+    # Reap it so it doesn't linger as a zombie if no new worker is spawned next.
+    for _ in range(10):  # up to ~1s
+        if proc.poll() is not None:
+            return
+        await asyncio.sleep(0.1)
+
+
+async def _recycle_worker(worker: Worker) -> None:
+    """Replace a dead/poisoned worker's process and re-add it to the pool.
+
+    Runs as a background task: the triggering request has already moved on (it
+    retries on another GPU), so the only effect here is that this one GPU sits
+    out of the idle queue until its fresh pipeline finishes loading.
+    """
+    assert _state is not None and _state.client is not None
+    if worker.recycling:  # a respawn is already in flight for this worker
+        return
+    worker.recycling = True
+    worker.alive = False
+    try:
+        logger.warning("Recycling worker %s (pid %s)...", worker.label, worker.proc.pid)
+        await _kill_proc(worker.proc)
+        worker.proc = _start_proc(_state.cfg, worker.gpu, worker.port, worker.label)
+        if await _await_ready(_state.client, worker, _state.cfg.worker_startup_timeout):
+            worker.alive = True
+            _state.idle.put_nowait(worker)
+            logger.info("Worker %s recovered and back in pool", worker.label)
+        else:
+            logger.error("Worker %s failed to recover; leaving out of pool", worker.label)
+    finally:
+        worker.recycling = False
+
+
+def _schedule_recycle(worker: Worker) -> None:
+    assert _state is not None
+    task = asyncio.create_task(_recycle_worker(worker))
+    _state.recycle_tasks.add(task)
+    task.add_done_callback(_state.recycle_tasks.discard)
+
+
+async def _await_ready(client: httpx.AsyncClient, worker: Worker, timeout: float) -> bool:
+    """Poll a worker's /health until its pipeline is loaded or we time out."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if worker.proc.poll() is not None:
+            logger.error("Worker %s exited during startup (code %s)", worker.label, worker.proc.returncode)
+            return False
+        try:
+            r = await client.get(f"{worker.url}/health", timeout=5.0)
+            if r.status_code == 200 and r.json().get("pipeline_loaded"):
+                return True
+        except httpx.HTTPError:
+            pass
+        await asyncio.sleep(2.0)
+    logger.error("Worker %s did not become ready within %.0fs", worker.label, timeout)
+    return False
+
+
+async def _terminate_workers(workers: List[Worker]) -> None:
+    # Reuse the async _kill_proc (graceful SIGTERM -> wait -> SIGKILL -> reap) for
+    # every worker in parallel, so shutdown never blocks the event loop and no
+    # killed child is left unreaped.
+    await asyncio.gather(*(_kill_proc(w.proc) for w in workers))
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    assert _state is not None
+    cfg = _state.cfg
+    _state.client = httpx.AsyncClient()
+    _state.idle = asyncio.Queue()  # bind to the now-running event loop
+
+    # Staggered startup: bring up the first worker alone and wait for it to load.
+    # That one worker populates every shared cache (HF weights *and* the
+    # torch.hub / DINOv2 download) while the others aren't running yet — so on a
+    # cold machine there's a single download pass instead of N workers racing to
+    # fetch the same files. Once it's ready, the rest load straight from cache.
+    ports = [cfg.worker_base_port + i for i in range(len(cfg.gpus))]
+    first = _spawn_worker(cfg, cfg.gpus[0], ports[0])
+    _state.workers.append(first)
+    logger.info("Bringing up %s first to warm the weight caches...", first.label)
+    first_ok = await _await_ready(_state.client, first, cfg.worker_startup_timeout)
+
+    rest = [_spawn_worker(cfg, gpu, port) for gpu, port in zip(cfg.gpus[1:], ports[1:])]
+    _state.workers.extend(rest)
+    if rest:
+        logger.info("Caches warm; starting remaining %d worker(s) from cache", len(rest))
+    rest_ok = await asyncio.gather(
+        *(_await_ready(_state.client, w, cfg.worker_startup_timeout) for w in rest)
+    )
+
+    ready = [w for w, ok in zip(_state.workers, [first_ok, *rest_ok]) if ok]
+    for w in ready:
+        _state.idle.put_nowait(w)
+
+    if not ready:
+        await _terminate_workers(_state.workers)
+        await _state.client.aclose()
+        raise RuntimeError("No workers became ready; aborting gateway startup.")
+    if len(ready) < len(_state.workers):
+        logger.warning("%d/%d workers ready; serving with reduced capacity.", len(ready), len(_state.workers))
+
+    # A multi-line banner so "we're up" is easy to spot in the worker log spam.
+    url = f"http://{cfg.host}:{cfg.port}"
+    bar = "=" * 64
+    logger.info(
+        "\n%s\n  RecGen gateway READY — serving on %s\n"
+        "  %d/%d GPU worker(s) up: %s\n"
+        "  POST %s/generate   GET %s/health\n%s",
+        bar, url, len(ready), len(_state.workers), [w.label for w in ready],
+        url, url, bar,
+    )
+
+    try:
+        yield
+    finally:
+        logger.info("Shutting down workers...")
+        await _terminate_workers(_state.workers)
+        if _state.client is not None:
+            await _state.client.aclose()
+
+
+app = FastAPI(
+    title="RecGen Inference Gateway",
+    description="Dispatches single-view reconstruction requests across one worker per GPU.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+def _alive_workers() -> List[Worker]:
+    assert _state is not None
+    alive: List[Worker] = []
+    for w in _state.workers:
+        # A worker can die while idle (crash with no request in flight); reflect
+        # that here so /health doesn't keep reporting it alive. It'll be recycled
+        # when next popped (the proxied POST fails and triggers the retry path).
+        if w.alive and w.proc.poll() is not None:
+            w.alive = False
+        if w.alive:
+            alive.append(w)
+    return alive
+
+
+@app.get("/health")
+def health() -> JSONResponse:
+    assert _state is not None
+    alive = _alive_workers()
+    return JSONResponse({
+        "status": "ok" if alive else "error",
+        # Kept for client compatibility: true once at least one GPU can serve.
+        "pipeline_loaded": len(alive) > 0,
+        "checkpoint": _state.cfg.checkpoint,
+        "workers_total": len(_state.workers),
+        "workers_alive": len(alive),
+        "workers_idle": _state.idle.qsize(),
+    })
+
+
+async def _acquire(timeout: float) -> Worker:
+    assert _state is not None
+    try:
+        return await asyncio.wait_for(_state.idle.get(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"all GPUs busy; no worker free within {timeout:.0f}s",
+        )
+
+
+@app.post("/generate")
+async def generate_endpoint(request: Request) -> Response:
+    """Proxy one /generate call to an idle GPU worker, queuing if all are busy."""
+    assert _state is not None and _state.client is not None
+    cfg = _state.cfg
+    body = await request.body()
+    if not body:
+        # Reject before acquiring a worker: no point cycling a GPU through the
+        # idle queue just to have the worker 400 an empty body.
+        raise HTTPException(status_code=400, detail="empty request body")
+    content_type = request.headers.get("content-type", "application/x-msgpack")
+
+    req_id = next(_req_counter)
+    t_arrival = time.perf_counter()
+    logger.info(
+        "req#%d arrived  body=%d bytes  idle=%d/%d workers free",
+        req_id, len(body), _state.idle.qsize(), len(_alive_workers()),
+    )
+
+    tried: List[str] = []
+    # Retry once on a *different* worker if the worker process dies or stops
+    # responding. A crash (segfault / OOM-kill), a poisoned-CUDA-context
+    # self-exit, or a wedged-but-alive worker that blows the read timeout all
+    # surface here as a network/timeout error; either way we recycle that worker
+    # (background respawn) and retry elsewhere. Recoverable inference errors come
+    # back as an HTTP error *status* from a live worker and are forwarded
+    # verbatim, not retried.
+    #
+    # The acquire→use is wrapped in try/finally so the worker is *never* lost:
+    # it's returned to the idle pool only if it answered and is still alive,
+    # and recycled in every other case (timeout, network error, unexpected
+    # exception, or process exit). Without this an uncaught error would leave a
+    # popped worker neither re-pooled nor recycled, shrinking the pool each time.
+    for _ in range(2):
+        # Pop a free GPU off the idle queue, FIFO-waiting if all are busy. The
+        # wait time below is how long this request sat queued behind others.
+        if _state.idle.empty():
+            logger.info("req#%d queued  all %d worker(s) busy", req_id, len(_alive_workers()))
+        t_wait = time.perf_counter()
+        worker = await _acquire(cfg.queue_timeout)
+        logger.info(
+            "req#%d -> %s  acquired after %.3fs wait  idle now=%d",
+            req_id, worker.label, time.perf_counter() - t_wait, _state.idle.qsize(),
+        )
+        t0 = time.perf_counter()
+        requeue = False  # only set True once we have a clean response from a live worker
+        try:
+            try:
+                resp = await _state.client.post(
+                    f"{worker.url}/generate",
+                    content=body,
+                    headers={"Content-Type": content_type},
+                    timeout=cfg.request_timeout,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+                tried.append(worker.label)
+                logger.error("req#%d worker %s request failed (%s); recycling", req_id, worker.label, type(e).__name__)
+                continue  # finally recycles this worker; loop retries on another
+            # Worker answered. If its process has since exited (e.g. it
+            # self-exited right after responding due to a poisoned context),
+            # recycle rather than returning a dead worker to the pool.
+            if worker.proc.poll() is not None:
+                logger.error("req#%d worker %s exited after responding (code %s); recycling", req_id, worker.label, worker.proc.returncode)
+            else:
+                requeue = True
+            logger.info(
+                "req#%d done on %s  status=%d  proxy=%.3fs  total=%.3fs  req_bytes=%d resp_bytes=%d",
+                req_id, worker.label, resp.status_code, time.perf_counter() - t0,
+                time.perf_counter() - t_arrival, len(body), len(resp.content),
+            )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/x-msgpack"),
+            )
+        finally:
+            if requeue:
+                _state.idle.put_nowait(worker)
+            else:
+                _schedule_recycle(worker)
+
+    logger.error("req#%d failed on all attempted workers: %s", req_id, tried)
+    raise HTTPException(status_code=502, detail=f"all attempted workers failed: {tried}")
+
+
+# ---------------------------------------------------------------------------
+# GPU discovery + CLI
+# ---------------------------------------------------------------------------
+
+def _detect_gpus() -> List[str]:
+    """Best-effort GPU list: CUDA_VISIBLE_DEVICES, else `nvidia-smi -L`."""
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env:
+        return [g.strip() for g in env.split(",") if g.strip()]
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-L"], text=True)
+        n = sum(1 for line in out.splitlines() if line.strip().startswith("GPU "))
+        if n:
+            return [str(i) for i in range(n)]
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return []
+
+
+def _parse_gpus(raw: Optional[str]) -> List[str]:
+    if raw:
+        return [g.strip() for g in raw.split(",") if g.strip()]
+    gpus = _detect_gpus()
+    if not gpus:
+        raise SystemExit(
+            "Could not detect any GPUs. Pass --gpus explicitly, e.g. --gpus 0,1,2,3"
+        )
+    return gpus
+
+
+def main() -> None:
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Multi-GPU gateway for RecGen inference")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=18324, help="Public gateway port")
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help="Comma-separated GPU ids (default: CUDA_VISIBLE_DEVICES or all detected). One worker per id.",
+    )
+    parser.add_argument(
+        "--worker-base-port",
+        type=int,
+        default=18401,
+        help="First internal worker port; worker i listens on base+i.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="recgen_base.multiview_stereo",
+        help="RecGen checkpoint name (passed to every worker).",
+    )
+    parser.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=300.0,
+        help="Max seconds a request waits for a free GPU before 503.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600.0,
+        help="Max seconds for a single worker /generate to complete.",
+    )
+    parser.add_argument(
+        "--worker-startup-timeout",
+        type=float,
+        default=600.0,
+        help="Max seconds to wait for each worker's pipeline to load at startup.",
+    )
+    parser.add_argument("--log-level", default="info")
+    args = parser.parse_args()
+    args.gpus = _parse_gpus(args.gpus)
+
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s [gateway] %(message)s",
+    )
+    # httpx logs every proxied request at INFO — far too chatty for the gateway.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    global _state
+    _state = GatewayState(cfg=args)
+    logger.info("Starting gateway for GPUs %s (workers on ports %d..%d)",
+                args.gpus, args.worker_base_port, args.worker_base_port + len(args.gpus) - 1)
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, workers=1)
+
+
+if __name__ == "__main__":
+    main()
