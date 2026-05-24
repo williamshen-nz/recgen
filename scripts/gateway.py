@@ -53,6 +53,7 @@ class Worker:
     port: int
     proc: subprocess.Popen
     alive: bool = True
+    recycling: bool = False  # guards against starting two respawns at once
 
     @property
     def url(self) -> str:
@@ -65,6 +66,8 @@ class GatewayState:
     workers: List[Worker] = field(default_factory=list)
     idle: "asyncio.Queue[Worker]" = field(default_factory=asyncio.Queue)
     client: Optional[httpx.AsyncClient] = None
+    # Strong refs to in-flight recycle tasks (asyncio may GC unreferenced ones).
+    recycle_tasks: set = field(default_factory=set)
 
 
 _state: Optional[GatewayState] = None
@@ -74,8 +77,7 @@ _state: Optional[GatewayState] = None
 # Worker lifecycle
 # ---------------------------------------------------------------------------
 
-def _spawn_worker(cfg: argparse.Namespace, gpu: str, port: int) -> Worker:
-    label = f"gpu{gpu}"
+def _start_proc(cfg: argparse.Namespace, gpu: str, port: int, label: str) -> subprocess.Popen:
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = gpu
     env["RECGEN_WORKER_LABEL"] = label
@@ -91,8 +93,57 @@ def _spawn_worker(cfg: argparse.Namespace, gpu: str, port: int) -> Worker:
     ]
     logger.info("Spawning worker %s on port %d (CUDA_VISIBLE_DEVICES=%s)", label, port, gpu)
     # Inherit stdout/stderr so worker logs (prefixed with [gpuN]) interleave here.
-    proc = subprocess.Popen(cmd, env=env, cwd=str(REPO_ROOT))
-    return Worker(label=label, gpu=gpu, port=port, proc=proc)
+    return subprocess.Popen(cmd, env=env, cwd=str(REPO_ROOT))
+
+
+def _spawn_worker(cfg: argparse.Namespace, gpu: str, port: int) -> Worker:
+    label = f"gpu{gpu}"
+    return Worker(label=label, gpu=gpu, port=port, proc=_start_proc(cfg, gpu, port, label))
+
+
+async def _kill_proc(proc: subprocess.Popen) -> None:
+    """Terminate a process without blocking the event loop."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    for _ in range(50):  # up to ~10s
+        if proc.poll() is not None:
+            return
+        await asyncio.sleep(0.2)
+    proc.kill()
+
+
+async def _recycle_worker(worker: Worker) -> None:
+    """Replace a dead/poisoned worker's process and re-add it to the pool.
+
+    Runs as a background task: the triggering request has already moved on (it
+    retries on another GPU), so the only effect here is that this one GPU sits
+    out of the idle queue until its fresh pipeline finishes loading.
+    """
+    assert _state is not None and _state.client is not None
+    if worker.recycling:  # a respawn is already in flight for this worker
+        return
+    worker.recycling = True
+    worker.alive = False
+    try:
+        logger.warning("Recycling worker %s (pid %s)...", worker.label, worker.proc.pid)
+        await _kill_proc(worker.proc)
+        worker.proc = _start_proc(_state.cfg, worker.gpu, worker.port, worker.label)
+        if await _await_ready(_state.client, worker, _state.cfg.worker_startup_timeout):
+            worker.alive = True
+            _state.idle.put_nowait(worker)
+            logger.info("Worker %s recovered and back in pool", worker.label)
+        else:
+            logger.error("Worker %s failed to recover; leaving out of pool", worker.label)
+    finally:
+        worker.recycling = False
+
+
+def _schedule_recycle(worker: Worker) -> None:
+    assert _state is not None
+    task = asyncio.create_task(_recycle_worker(worker))
+    _state.recycle_tasks.add(task)
+    task.add_done_callback(_state.recycle_tasks.discard)
 
 
 async def _await_ready(client: httpx.AsyncClient, worker: Worker, timeout: float) -> bool:
@@ -210,8 +261,11 @@ async def generate_endpoint(request: Request) -> Response:
     content_type = request.headers.get("content-type", "application/x-msgpack")
 
     tried: List[str] = []
-    # Retry once on a *different* worker if a connection dies (worker crashed).
-    # Inference errors from a live worker are forwarded verbatim, not retried.
+    # Retry once on a *different* worker if the worker process dies. A crash
+    # (segfault / OOM-kill) OR a poisoned-CUDA-context self-exit both drop the
+    # connection here; either way we recycle that worker (background respawn) and
+    # retry elsewhere. Recoverable inference errors come back as an HTTP error
+    # *status* from a live worker and are forwarded verbatim, not retried.
     for _ in range(2):
         worker = await _acquire(cfg.queue_timeout)
         t0 = time.perf_counter()
@@ -223,13 +277,18 @@ async def generate_endpoint(request: Request) -> Response:
                 timeout=cfg.request_timeout,
             )
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ConnectTimeout) as e:
-            # Worker is unreachable: drop it from the pool (no respawn in v1).
-            worker.alive = False
             tried.append(worker.label)
-            logger.error("Worker %s connection failed (%s); dropping from pool", worker.label, type(e).__name__)
+            logger.error("Worker %s connection failed (%s); recycling", worker.label, type(e).__name__)
+            _schedule_recycle(worker)
             continue
-        # Worker answered (possibly an error status): it is alive, return it.
-        _state.idle.put_nowait(worker)
+        # Worker answered. If its process has since exited (e.g. it self-exited
+        # right after responding due to a poisoned context), recycle rather than
+        # returning a dead worker to the pool.
+        if worker.proc.poll() is not None:
+            logger.error("Worker %s exited after responding (code %s); recycling", worker.label, worker.proc.returncode)
+            _schedule_recycle(worker)
+        else:
+            _state.idle.put_nowait(worker)
         logger.info(
             "/generate -> %s  status=%d  proxy=%.3fs  req_bytes=%d resp_bytes=%d",
             worker.label, resp.status_code, time.perf_counter() - t0, len(body), len(resp.content),
@@ -240,7 +299,7 @@ async def generate_endpoint(request: Request) -> Response:
             media_type=resp.headers.get("content-type", "application/x-msgpack"),
         )
 
-    raise HTTPException(status_code=502, detail=f"worker(s) failed: {tried}")
+    raise HTTPException(status_code=502, detail=f"all attempted workers failed: {tried}")
 
 
 # ---------------------------------------------------------------------------

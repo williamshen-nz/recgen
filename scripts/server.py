@@ -29,6 +29,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 import msgpack
 import msgpack_numpy
 import numpy as np
+import torch
 import trimesh
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
@@ -45,6 +46,36 @@ logger = logging.getLogger("recgen_inference.server")
 # process, so the one pipeline/GPU is never driven by two threads at once —
 # even if this worker is hit concurrently outside the gateway.
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def _cuda_context_broken() -> bool:
+    """Probe whether this process's CUDA context is still usable.
+
+    Some failures (device-side assert, illegal memory access) corrupt the CUDA
+    context: the process keeps running but every subsequent op raises. A clean
+    error (bad input, CPU-side exception, recoverable OOM) leaves the context
+    intact. We test with a trivial op so the caller can tell "retry me later" /
+    "I'm wedged, kill me" apart.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.synchronize()
+        _ = (torch.zeros(8, device="cuda") + 1).sum().item()
+        torch.cuda.synchronize()
+        return False
+    except Exception:
+        return True
+
+
+def _hard_exit(code: int = 70) -> None:
+    """Flush logs and terminate the process so the gateway respawns this worker."""
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    os._exit(code)
 
 _state: Dict[str, Any] = {"pipeline": None, "checkpoint": None, "device": None}
 
@@ -221,19 +252,29 @@ async def generate_endpoint(request: Request) -> Response:
     # (/health keeps answering, the gateway can probe liveness) while keeping
     # generations serialized — the one pipeline/GPU is never driven concurrently.
     loop = asyncio.get_running_loop()
-    response_body, inference_s, decimation_s = await loop.run_in_executor(
-        _executor,
-        functools.partial(
-            _run_generate,
-            pipeline,
-            rgb_arr,
-            depth_arr,
-            mask_arr,
-            K,
-            seed,
-            target_faces,
-        ),
-    )
+    try:
+        response_body, inference_s, decimation_s = await loop.run_in_executor(
+            _executor,
+            functools.partial(
+                _run_generate,
+                pipeline,
+                rgb_arr,
+                depth_arr,
+                mask_arr,
+                K,
+                seed,
+                target_faces,
+            ),
+        )
+    except Exception as e:
+        # If the CUDA context is now wedged, this worker is useless for every
+        # future request — exit hard so the gateway respawns us with a fresh
+        # context. Otherwise it was a recoverable error: report it and stay up.
+        if await loop.run_in_executor(_executor, _cuda_context_broken):
+            logger.error("CUDA context unusable after %s; exiting for respawn: %s", type(e).__name__, e)
+            _hard_exit()
+        logger.exception("generation failed (recoverable)")
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
     total_s = time.perf_counter() - t_start
     logger.info(
         "/generate ok  inference=%.3fs  decimation=%.3fs  total=%.3fs  rgb=%s depth=%s target_faces=%s req_bytes=%d resp_bytes=%d",

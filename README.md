@@ -158,9 +158,11 @@ the multi-GPU fan-out is transparent.
 For single-GPU debugging, `pixi run serve-worker` runs one worker directly
 (no gateway) on `:18324`.
 
-> A worker that crashes mid-request is dropped from the pool (the request retries
-> on another GPU). v1 does not auto-respawn workers — restart the gateway to
-> recover full capacity.
+> A worker that crashes (segfault/OOM-kill) or wedges its CUDA context is
+> recycled automatically: the in-flight request retries on another GPU while the
+> dead worker respawns in the background (its GPU rejoins the pool once the fresh
+> pipeline finishes loading). A worker detects an unrecoverable CUDA context
+> itself and self-exits so the gateway can replace it.
 
 ## Troubleshooting
 

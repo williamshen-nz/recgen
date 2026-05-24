@@ -43,6 +43,15 @@ client (aiohttp, unchanged)
   its own CUDA context; the gateway never sends a worker a second request while
   it's busy. Inside the worker, `generate()` runs in a single-thread executor so
   `/health` stays responsive but generations stay serialized.
+- **Self-healing workers.** A worker that crashes (segfault / OOM-kill) or
+  wedges its CUDA context is recycled: the in-flight request retries on another
+  GPU and the dead worker respawns in the background, rejoining the pool once its
+  pipeline reloads. The poisoned-context case is handled at the source — after a
+  failed generation the worker probes its CUDA context with a trivial op and, if
+  it's unusable (device-side assert / illegal memory access), self-exits so the
+  gateway replaces it instead of returning a wedged worker to the pool.
+  Recoverable errors (bad input, etc.) come back as an HTTP 500 and the worker
+  stays up.
 
 ## Files changed on this branch
 
@@ -115,13 +124,18 @@ confirm on the 4-GPU workstation:
    in roughly `ceil(N/4)` waves instead of `N` serial generations.
 5. **Backpressure** — with all GPUs busy and many more requests queued, extra
    ones should eventually 503 after `--queue-timeout` rather than hang forever.
+6. **Self-heal** (optional, if you can induce a failure): kill a worker process
+   (`kill <pid>` of one `server.py`) mid-load and confirm the gateway logs
+   `Recycling worker gpuN` and later `Worker gpuN recovered and back in pool`,
+   with `workers_alive` dipping then returning to 4.
 
 ## Known limitations / open decisions
 
-- **No worker auto-respawn (v1).** If a worker crashes mid-request, it's dropped
-  from the pool and the request retries on another GPU; capacity stays reduced
-  until you restart the gateway. Auto-respawn is a small add-on if wanted — flagged
-  for a decision, not yet implemented.
+- **Recycle reload cost.** A recycled worker is out of the pool for a full model
+  reload (the startup cost, for one GPU, in the background). Repeated instant
+  recycling of the *same* worker (e.g. a deterministically-crashing input) would
+  thrash; there's no backoff/circuit-breaker yet. Hasn't been a problem, flagged
+  in case failures cluster.
 - **Startup cost.** 4x model load + 4x VRAM. Confirm the box has enough VRAM per
   GPU for one pipeline each (it's the same footprint as the old single server,
   just times four — one model per card, not four on one card).
@@ -138,8 +152,13 @@ confirm on the 4-GPU workstation:
 - Gateway dispatch logic unit-tested with mocked workers (httpx `MockTransport`):
   happy-path worker release, `503` on saturation, retry-on-dead-worker, and
   `502` when all workers are dead — all pass.
+- Recycle logic unit-tested: connection-death schedules a background respawn (and
+  the request succeeds on another GPU), a worker that exits right after responding
+  is recycled rather than returned to the pool, and the double-recycle guard
+  holds — all pass.
+- `_cuda_context_broken()` verified to return `False` on a healthy GPU here.
 - Not yet run end-to-end against real GPUs/model — that's the verification list
-  above.
+  above (including the self-heal step).
 
 ## Rollback
 
